@@ -199,6 +199,7 @@ body {
 
 const CHAIN=12, TOP_K=15, MAX_EXPERTS=16, DOE_RANK=4, DOE_ALPHA=0.05, MAX_VOCAB=1280;
 const QPTQ_MAGIC=0x51505451;
+const VEL_NAMES=['WALK','RUN','STOP','BREATHE','UP','DOWN'];
 const CH_NAMES=['FEAR','LOVE','RAGE','VOID','FLOW','CMPLX'];
 const CH_DECAY=[0.90,0.93,0.85,0.97,0.88,0.94];
 const COUPLING=[[0,-0.3,0.5,0.4,-0.2,0.1],[-0.3,0,-0.4,-0.5,0.5,0.2],[0.5,-0.3,0,0.2,-0.3,0.3],[0.4,-0.5,0.3,0,-0.3,0.4],[-0.2,0.4,-0.2,-0.3,0,0.3],[0.1,0.2,0.3,0.4,0.3,0]];
@@ -351,8 +352,10 @@ class BPE {
 // ═══════════════════════════════════════════════════════════════
 // 2. MetaWeights
 // ═══════════════════════════════════════════════════════════════
+const MAX_PROPHECY=32;
+
 class MetaWeights {
-  constructor(){this.bi=new Map();this.tri=new Map();this.unigram=null;this.hebb=new Map();this.bigramCount=0;}
+  constructor(){this.bi=new Map();this.tri=new Map();this.unigram=null;this.hebb=new Map();this.prophecies=[];this.bigramCount=0;}
 
   build(ids,V){
     this.unigram=new Float32Array(V);
@@ -367,9 +370,6 @@ class MetaWeights {
     this.bigramCount=this.bi.size;
     // trigram
     for(let i=0;i<ids.length-2;i++){const k=ids[i]+','+ids[i+1]+','+ids[i+2];this.tri.set(k,(this.tri.get(k)||0)+1);}
-    const tctx=new Map();
-    for(const[k,c]of this.tri){const ab=k.slice(0,k.lastIndexOf(','));tctx.set(ab,(tctx.get(ab)||0)+c);}
-    for(const[k,c]of this.tri){const ab=k.slice(0,k.lastIndexOf(','));this.tri.set(k,c/(tctx.get(ab)||1));}
     // hebbian (capped)
     const hn=Math.min(ids.length,8000),win=5;
     for(let i=0;i<hn;i++){
@@ -424,9 +424,45 @@ class MetaWeights {
         if(a===p0&&b===p1&&c2<V&&!appeared.has(c2))out[c2]+=p*1.5; // trigrams more specific
       }
     }
+    for(const [target,strength,age] of this.prophecies){
+      if(target>=0&&target<V&&!appeared.has(target))out[target]+=strength*Math.log1p(age);
+    }
     let mx=0;for(let i=0;i<V;i++)if(out[i]>mx)mx=out[i];
     if(mx>0)for(let i=0;i<V;i++)out[i]/=mx;
     return out;
+  }
+
+  prophecyAdd(target,strength){
+    for(const item of this.prophecies){
+      if(item[0]===target){
+        item[1]=Math.max(item[1],strength);
+        item[2]=0;
+        return;
+      }
+    }
+    if(this.prophecies.length>=MAX_PROPHECY){
+      let oldest=0;
+      for(let i=1;i<this.prophecies.length;i++)if(this.prophecies[i][2]>this.prophecies[oldest][2])oldest=i;
+      this.prophecies.splice(oldest,1);
+    }
+    this.prophecies.push([target,strength,0]);
+  }
+
+  prophecyUpdate(token){
+    const kept=[];
+    for(const item of this.prophecies){
+      if(item[0]===token)continue;
+      const nextAge=item[2]+1;
+      const nextStrength=item[1]*0.995;
+      if(nextAge<50&&nextStrength>0.01)kept.push([item[0],nextStrength,nextAge]);
+    }
+    this.prophecies=kept;
+  }
+
+  prophecyPressure(){
+    let total=0;
+    for(const [,strength,age] of this.prophecies)total+=strength*Math.log1p(age);
+    return Math.max(0,Math.min(1,total/4));
   }
 
   captureOnline(prev,cur){
@@ -683,51 +719,41 @@ class Chambers {
   }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// 4b. Dissonance & Velocity (micro-Klaus sonar)
-// ═══════════════════════════════════════════════════════════════
-const VEL_STOP=0,VEL_WALK=1,VEL_RUN=2,VEL_UP=3;
-const VEL_NAMES=["STOP","WALK","RUN","UP"];
-class SomaticSonar{
-  feel(ch,text){
-    for(const word of extractWords(text)){
-      const aff=SOMATIC_SEEDS[word];
-      if(aff)for(let k=0;k<6;k++)ch.act[k]+=0.12*aff[k];
-    }
-    for(let i=0;i<6;i++)ch.act[i]=Math.max(0,Math.min(1,ch.act[i]));
-  }
-  dissonance(mwObj,ids,V){
-    const n=ids.length;
-    if(n<=1)return 0.5;
-    let known=0;
-    for(let i=0;i<n-1;i++){
-      const k=ids[i]*65536+ids[i+1];
-      if(mwObj.bi.has(k))known++;
-    }
-    const ratio=known/(n-1);
-    return Math.max(0,Math.min(1,1-ratio));
-  }
-  autoVelocity(d){
-    if(d<0.2)return VEL_STOP;
-    if(d<0.5)return VEL_WALK;
-    if(d<0.8)return VEL_RUN;
-    return VEL_UP;
-  }
-  applyVelocity(vel,mod,temp){
-    if(vel===VEL_STOP)mod.a*=0.1;
-    else if(vel===VEL_RUN){mod.a*=1.5;mod.b*=1.2;}
-    else if(vel===VEL_UP){mod.b*=2.0;mod.g*=2.5;}
-    if(vel>=VEL_RUN)temp=Math.max(0.4,Math.min(0.85,temp+0.08));
-    if(vel===VEL_STOP)temp=Math.max(0.4,Math.min(0.85,temp-0.05));
-    mod.a=Math.max(0.3,Math.min(2,mod.a));mod.b=Math.max(0.3,Math.min(2,mod.b));
-    mod.g=Math.max(0.3,Math.min(2,mod.g));mod.t=Math.max(0.3,Math.min(2,mod.t));
-    return temp;
-  }
+function velocityProfile(currentChambers,dissonance){
+  let mode=0;
+  if(dissonance>0.8)mode=4;
+  else if(dissonance>0.6)mode=1;
+  else if(dissonance<0.2)mode=2;
+  else if(currentChambers.trauma>0.5)mode=3;
+  else if(currentChambers.debt>0.55)mode=5;
+  const prof={mode,name:VEL_NAMES[mode],tempMul:1,hebMul:1,proMul:1,dsMul:1,bgMul:1,tgMul:1,interfBonus:0,wormholeBonus:0,debtDecay:1,traumaDecay:1};
+  if(mode===1){prof.tempMul=1.12;prof.bgMul=1.15;prof.interfBonus=0.05;}
+  else if(mode===2){prof.tempMul=0.72;prof.dsMul=1.25;prof.debtDecay=0.75;}
+  else if(mode===3){prof.tempMul=0.9;prof.debtDecay=0.65;prof.traumaDecay=0.75;}
+  else if(mode===4){prof.tempMul=1.22;prof.proMul=1.25;prof.bgMul=0.9;prof.interfBonus=0.1;prof.wormholeBonus=0.05;}
+  else if(mode===5){prof.tempMul=0.82;prof.hebMul=1.1;prof.bgMul=1.1;prof.proMul=0.9;}
+  return prof;
 }
-const somatic=new SomaticSonar();
 
 class Interference {
   constructor(){this.docs=[];}
+  summarizeIds(ids,currentBpe,heavyLimit=32,keywordLimit=16){
+    const tmp=new MetaWeights();tmp.build(ids,currentBpe.vocabSize);
+    const counts=new Map();
+    for(const [k] of tmp.bi){
+      const a=k>>>16,b=k&0xffff;
+      counts.set(a,(counts.get(a)||0)+1);
+      counts.set(b,(counts.get(b)||0)+1);
+    }
+    const words=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>{
+      const dec=currentBpe.decode([tok]).trim().toLowerCase();
+      return {tok,dec};
+    }).filter(x=>x.dec.length>2&&/[a-z]/i.test(x.dec)).slice(0,heavyLimit);
+    return {
+      heavy:words.length?words.map(x=>x.tok):ids.slice(0,heavyLimit),
+      keywords:words.map(x=>x.dec).slice(0,keywordLimit)
+    };
+  }
   async loadDocs(currentBpe){
     this.docs=[];
     for(const name of DOC_FILES){
@@ -736,20 +762,71 @@ class Interference {
         if(!res.ok)continue;
         const text=await res.text();
         const ids=currentBpe.encode(text);
-        const tmp=new MetaWeights();tmp.build(ids,currentBpe.vocabSize);
-        const counts=new Map();
-        for(const [k] of tmp.bi){
-          const a=k>>>16,b=k&0xffff;
-          counts.set(a,(counts.get(a)||0)+1);
-          counts.set(b,(counts.get(b)||0)+1);
+        const doc={name,...this.summarizeIds(ids,currentBpe,32,16),chunks:[]};
+        const chunkLen=64,stride=32;
+        for(let start=0;start<ids.length;start+=stride){
+          const part=ids.slice(start,start+chunkLen);
+          if(part.length<12)continue;
+          const chunk=this.summarizeIds(part,currentBpe,16,8);
+          if(chunk.heavy.length){
+            chunk.start=start;
+            doc.chunks.push(chunk);
+          }
+          if(doc.chunks.length>=8)break;
         }
-        const heavy=[...counts.entries()].sort((a,b)=>b[1]-a[1]).map(([tok])=>tok).filter(tok=>{
-          const dec=currentBpe.decode([tok]).trim();
-          return dec.length>2&&/[a-z]/i.test(dec);
-        }).slice(0,32);
-        if(heavy.length)this.docs.push({name,heavy});
+        if(!doc.chunks.length&&doc.heavy.length)doc.chunks.push({start:0,heavy:doc.heavy.slice(0,16),keywords:doc.keywords.slice(0,8)});
+        if(doc.heavy.length)this.docs.push(doc);
       }catch(_err){}
     }
+  }
+  prophecyWords(currentMw,currentBpe){
+    const out=new Map();
+    if(!currentMw)return out;
+    for(const [target,strength,age] of currentMw.prophecies){
+      const word=currentBpe.decode([target]).trim().toLowerCase();
+      if(word.length>2&&/[a-z]/i.test(word))out.set(word,Math.max(out.get(word)||0,strength*Math.log1p(age)));
+    }
+    return out;
+  }
+  scoreItem(item,words,dom,currentPeriodic,prophecyWords){
+    let score=0.01*(item.heavy||[]).length;
+    for(const word of (item.keywords||[])){
+      if(words.has(word))score+=1.2;
+      if(word in ANCHORS&&ANCHORS[word]===dom)score+=0.6;
+      if(currentPeriodic){
+        const el=currentPeriodic.classify(word);
+        if(el&&el.ch===dom)score+=0.35*el.mass;
+      }
+      if(prophecyWords.has(word))score+=0.9*prophecyWords.get(word);
+    }
+    score+=Math.random()*0.05;
+    return score;
+  }
+  chooseDoc(text,currentChambers,currentPeriodic,currentMw,currentBpe){
+    if(!this.docs.length)return null;
+    const words=new Set(extractWords(text||''));
+    const dom=currentChambers?currentChambers.dominant():4;
+    const prophecyWords=this.prophecyWords(currentMw,currentBpe);
+    let best=this.docs[0],bestScore=-Infinity;
+    for(const doc of this.docs){
+      const score=this.scoreItem(doc,words,dom,currentPeriodic,prophecyWords);
+      if(score>bestScore){bestScore=score;best=doc;}
+    }
+    return best;
+  }
+  chooseChunk(doc,text,currentChambers,currentPeriodic,currentMw,currentBpe){
+    if(!doc)return null;
+    const chunks=doc.chunks||[];
+    if(!chunks.length)return doc;
+    const words=new Set(extractWords(text||''));
+    const dom=currentChambers?currentChambers.dominant():4;
+    const prophecyWords=this.prophecyWords(currentMw,currentBpe);
+    let best=chunks[0],bestScore=-Infinity;
+    for(const chunk of chunks){
+      const score=this.scoreItem(chunk,words,dom,currentPeriodic,prophecyWords);
+      if(score>bestScore){bestScore=score;best=chunk;}
+    }
+    return best;
   }
   injectSeed(currentChambers,currentBpe,currentPeriodic){
     if(!this.docs.length)return null;
@@ -768,6 +845,34 @@ class Interference {
     }
     return best;
   }
+  injectSeedFromDoc(doc,currentChambers,currentBpe,currentPeriodic){
+    if(!doc||!doc.heavy.length)return null;
+    const dom=currentChambers.dominant();
+    let best=doc.heavy[0],bestScore=-Infinity;
+    for(const tid of doc.heavy){
+      const word=currentBpe.decode([tid]).trim().toLowerCase();
+      let score=Math.random()*0.05;
+      if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
+      if(currentPeriodic){
+        const el=currentPeriodic.classify(word);
+        if(el&&el.ch===dom)score+=0.5*el.mass;
+      }
+      if(score>bestScore){bestScore=score;best=tid;}
+    }
+    return best;
+  }
+}
+
+function interferenceSignal(doc,V){
+  const out=new Float32Array(V);
+  if(!doc)return out;
+  let mx=0;
+  for(let rank=0;rank<doc.heavy.length&&rank<16;rank++){
+    const tid=doc.heavy[rank];
+    if(tid>=0&&tid<V){out[tid]+=1/(1+rank);if(out[tid]>mx)mx=out[tid];}
+  }
+  if(mx>1e-8)for(let i=0;i<V;i++)out[i]/=mx;
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -958,7 +1063,7 @@ function coherenceScore(ids){
 let _zeroTokCache=null;
 function _zeroTok(V,D){if(!_zeroTokCache||_zeroTokCache.length!==V*D)_zeroTokCache=new Float32Array(V*D);return _zeroTokCache;}
 
-function genSentence(prompt,temp,gdest){
+function genSentence(prompt,temp,gdest,velocity){
   const V=tf&&tf.loaded?tf.V:bpe.vocabSize;
   const D=tf&&tf.loaded?tf.D:48;
   if(tf&&tf.loaded)tf.reset();
@@ -968,11 +1073,6 @@ function genSentence(prompt,temp,gdest){
   let prevChosen=-1;
   const ctx=[...prompt],out=[...prompt];
   const mod=chambers?chambers.modulate():{a:1,b:1,g:1,t:1};
-  // apply somatic velocity to coefficients (matches C apply_velocity)
-  if(typeof somaticVel!=='undefined'&&typeof somatic!=='undefined'){
-    const baseTemp=temp;
-    somatic.applyVelocity(somaticVel,mod,baseTemp);
-  }
   // token embeddings: from transformer or zero (matches C zero-weight fallback)
   const tokEmb=tf&&tf.loaded?tf.tok:_zeroTok(V,D);
 
@@ -1024,6 +1124,7 @@ function genSentence(prompt,temp,gdest){
     const hs=Math.max(0,ctx.length-8);
     const heb=mw.queryHebb(ctx.slice(hs),V);
     const pro=mw.queryProphecy(ctx,V);
+    const pDebt=mw.prophecyPressure();
 
     // trauma
     if(chambers&&chambers.trauma>0.1)for(let i=0;i<V;i++)raw[i]/=(1+chambers.trauma);
@@ -1031,7 +1132,14 @@ function genSentence(prompt,temp,gdest){
     // detect transformer activity
     let tmag=0;for(let i=0;i<V;i++)tmag+=Math.abs(raw[i]);tmag/=V;
     const hasTf=tmag>0.1;
-    const cHeb=(hasTf?0.6:1.0)*mod.a,cPro=(hasTf?0.4:0.7)*mod.b,cDs=(hasTf?0.3:0.15)*mod.g,cBg=hasTf?5:15,cTg=hasTf?3:10;
+    let cHeb=(hasTf?0.6:1.0)*mod.a,cPro=(hasTf?0.4:0.7)*mod.b,cDs=(hasTf?0.3:0.15)*mod.g,cBg=hasTf?5:15,cTg=hasTf?3:10;
+    if(velocity){
+      cHeb*=velocity.hebMul;
+      cPro*=velocity.proMul*(1+0.35*pDebt);
+      cDs*=velocity.dsMul;
+      cBg*=velocity.bgMul;
+      cTg*=velocity.tgMul;
+    }
 
     for(let i=0;i<V;i++){
       const bg=mw.queryBi(ctx[ctx.length-1],i);
@@ -1043,6 +1151,7 @@ function genSentence(prompt,temp,gdest){
         if(en>1e-8){let dot=0;for(let d=0;d<D;d++)dot+=destiny[d]*tokEmb[i*D+d];ds=dot/(dn*en);}
       }
       raw[i]+=cHeb*heb[i]+cPro*pro[i]+cDs*ds+cBg*bg+cTg*tg;
+      if(velocity&&velocity.docSignal)raw[i]+=(hasTf?0.18:0.32)*velocity.docSignal[i];
       if(mw.unigram[i]<1e-6)raw[i]-=2;
       else if(mw.unigram[i]>0.01)raw[i]-=0.3*(mw.unigram[i]-0.01)*100;
     }
@@ -1063,10 +1172,14 @@ function genSentence(prompt,temp,gdest){
       else ch=sampleNucleus(raw,V,0.5,0.7);
     }else if(step<4){
       ch=0;let mx=raw[0];for(let i=1;i<V;i++)if(raw[i]>mx){mx=raw[i];ch=i;}
-    }else ch=sampleNucleus(raw,V,Math.max(0.3,Math.min(1.2,temp*mod.t)),0.85);
+    }else{
+      const velTemp=velocity?velocity.tempMul:1;
+      ch=sampleNucleus(raw,V,Math.max(0.25,Math.min(1.35,temp*mod.t*velTemp)),0.85);
+    }
 
     prevChosen=ch;
     out.push(ch);ctx.push(ch);
+    mw.prophecyUpdate(ch);
     // word capture: bigram + Hebbian (matches C online capture)
     if(ctx.length>=2){
       mw.captureOnline(ctx[ctx.length-2],ch);
@@ -1078,6 +1191,21 @@ function genSentence(prompt,temp,gdest){
         const k=a*65536+b;
         mw.hebb.set(k,(mw.hebb.get(k)||0)+decay*0.005);
       }
+      const prev=ctx[ctx.length-2],cur=ch;
+      let bestPred=-1,bestProb=0;
+      for(const [k,p] of mw.tri){
+        const parts=k.split(',');
+        if(parts.length!==3)continue;
+        const a=Number(parts[0]),b=Number(parts[1]),c2=Number(parts[2]);
+        if(a===prev&&b===cur&&p>bestProb){bestProb=p;bestPred=c2;}
+      }
+      if(bestPred<0){
+        for(const [k,p] of mw.bi){
+          const a=k>>>16,b=k&0xffff;
+          if(a===cur&&p>bestProb){bestProb=p;bestPred=b;}
+        }
+      }
+      if(bestPred>=0)mw.prophecyAdd(bestPred,0.2+0.5*bestProb);
     }
     if(bpe.isBoundary(ch)&&step>8)break;
   }
@@ -1151,21 +1279,20 @@ function generateChain(inputText){
 
   const nb=Math.max(1,Math.min(CHAIN-1,Math.floor(CHAIN*(0.3+0.4*chambers.debt+0.1*cd))));
 
-  // somatic dissonance + velocity (micro-Klaus sonar)
-  let somaticDiss=0.5,somaticVel=VEL_WALK;
   if(inputText){
     const uids=bpe.encode(inputText);
     ingestIds(uids,0.02);
     if(uids.length>1)log(`[ingested ${uids.length} tokens: +bi +tri +hebb]`,'sys');
     chambers.feel(inputText,periodic);
-    somaticDiss=somatic.dissonance(mw,uids,V);
-    somaticVel=somatic.autoVelocity(somaticDiss);
     chambers.act[4]=Math.min(1,chambers.act[4]+0.1);
     chambers.crossfire(8);
   }
+  const velocity=velocityProfile(chambers,cd);
+  chambers.debt=Math.max(0,Math.min(1,(0.88*chambers.debt+0.12*mw.prophecyPressure())*velocity.debtDecay));
+  chambers.trauma=Math.max(0,Math.min(1,chambers.trauma*velocity.traumaDecay));
 
   const modeStr=tf&&tf.loaded?'TRAINED':'METAWEIGHTS ONLY';
-  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} somatic_d=${somaticDiss.toFixed(3)} vel=${VEL_NAMES[somaticVel]} [${modeStr}]`);
+  log(`diss=${cd.toFixed(3)} debt=${chambers.debt.toFixed(3)} emrg=${chambers.emergence().toFixed(3)} vel=${velocity.name} [${modeStr}]`);
   log(`chambers: ${chambers.summary()}`,'sys');
   if(interference&&interference.docs.length)log(`interference: ${interference.docs.length} docs loaded`,'sys');
   updateStats();
@@ -1179,9 +1306,16 @@ function generateChain(inputText){
 
   for(let si=0;si<CHAIN;si++){
     let dir=si<nb?-1:si===nb?0:1;
+    const activeDoc=interference&&interference.docs.length?interference.chooseDoc(inputText,chambers,periodic,mw,bpe):null;
+    const activeChunk=activeDoc?interference.chooseChunk(activeDoc,inputText,chambers,periodic,mw,bpe):null;
+    velocity.docSignal=activeChunk?interferenceSignal(activeChunk,V):null;
+    if(activeChunk&&activeChunk.heavy.length){
+      const seedTok=activeChunk.heavy[0];
+      if(seedTok>=0&&seedTok<V)for(let d=0;d<D;d++)gdest[d]=0.97*gdest[d]+0.03*tokEmb[seedTok*D+d];
+    }
     let prompt=null,usedInterf=false;
-    if(interference&&interference.docs.length&&Math.random()<0.3){
-      const seed=interference.injectSeed(chambers,bpe,periodic);
+    if(interference&&interference.docs.length&&Math.random()<Math.max(0.05,Math.min(0.5,0.3+velocity.interfBonus))){
+      const seed=activeChunk?interference.injectSeedFromDoc(activeChunk,chambers,bpe,periodic):(activeDoc?interference.injectSeedFromDoc(activeDoc,chambers,bpe,periodic):interference.injectSeed(chambers,bpe,periodic));
       if(seed!==null){prompt=[seed];usedInterf=true;}
     }
     if(!prompt&&inputText){
@@ -1224,14 +1358,14 @@ function generateChain(inputText){
     const tSec=si/CHAIN;
     const schumann=0.4*Math.sin(2*Math.PI*7.83*tSec)+0.2*Math.sin(2*Math.PI*14.3*tSec)+0.1*Math.sin(2*Math.PI*20.8*tSec)+0.05*Math.sin(2*Math.PI*27.3*tSec);
     const baseTemp=tf&&tf.loaded?0.6:0.75;
-    const temp=Math.max(0.4,Math.min(0.85,baseTemp+0.08*schumann));
+    const temp=Math.max(0.35,Math.min(0.95,(baseTemp+0.08*schumann)*velocity.tempMul));
 
     // best of 3
     let bestOut=null,bestSc=-Infinity;
     const gdestSave=new Float32Array(gdest);
     for(let cand=0;cand<3;cand++){
       if(cand>0)gdest.set(gdestSave);
-      const o=genSentence(prompt,temp,gdest);
+      const o=genSentence(prompt,temp,gdest,velocity);
       const sc=coherenceScore(o);
       if(sc>bestSc){bestSc=sc;bestOut=o;}
       if(bestSc>1&&bestOut.length>12)break;
@@ -1241,13 +1375,14 @@ function generateChain(inputText){
     if(si<CHAIN-1){
       let whProb=0.02;
       if(cd>0.3)whProb+=((cd-0.3)/0.7)*0.15;
+      whProb=Math.max(0,Math.min(0.3,whProb+velocity.wormholeBonus));
       wormhole=Math.random()<whProb;
       if(wormhole&&interference&&interference.docs.length){
         const farthest=[...interference.docs].sort((a,b)=>b.heavy.length-a.heavy.length)[0];
         if(farthest&&farthest.heavy.length){
           dir=dir!==0?-dir:1;
           const whPrompt=[farthest.heavy[Math.floor(Math.random()*farthest.heavy.length)]];
-          bestOut=genSentence(whPrompt,tf&&tf.loaded?0.55:0.7,gdest);
+          bestOut=genSentence(whPrompt,tf&&tf.loaded?0.55:0.7,gdest,velocity);
           bestSc=coherenceScore(bestOut);
         }
       }
@@ -1280,7 +1415,7 @@ function generateChain(inputText){
       const nprom=Math.min(3,chainIds[seedSrc].length);
       const rPrompt=chainIds[seedSrc].slice(chainIds[seedSrc].length-nprom);
       const rTemp=tf&&tf.loaded?0.55:0.7;
-      const rOut=genSentence(rPrompt,rTemp,gdest);
+      const rOut=genSentence(rPrompt,rTemp,gdest,velocity);
       const newSc=coherenceScore(rOut);
       const oldSc=coherenceScore(chainIds[weakIdx]);
       if(newSc>oldSc*0.7||rOut.length>chainIds[weakIdx].length){ // accept if reasonable
@@ -1351,6 +1486,19 @@ async function initCorpus(text){
   $('#btn-gen').disabled=false;$('#prompt').disabled=false;$('#btn-send').disabled=false;
 }
 
+async function autoBootFromQuery(){
+  const qp=new URLSearchParams(window.location.search);
+  if(qp.get('demo')!=='1')return;
+  await initCorpus(DEMO);
+  const prompt=qp.get('prompt');
+  if(prompt){
+    setTimeout(()=>{
+      $('#prompt').value=prompt;
+      $('#btn-gen').click();
+    },200);
+  }
+}
+
 $('#btn-demo').onclick=()=>initCorpus(DEMO);
 $('#btn-gen').onclick=()=>{const v=$('#prompt').value.trim();$('#prompt').value='';if(v)log(`\nq> ${v}`,'sys');generateChain(v||null);};
 $('#btn-send').onclick=$('#btn-gen').onclick;
@@ -1372,6 +1520,8 @@ document.body.ondrop=e=>{
     else if(f.name.endsWith('.merges')){const r=new FileReader();r.onload=()=>{bpe=new BPE();bpe.loadBinary(r.result);log(`Merges loaded: ${bpe.merges.length}`,'sys');};r.readAsArrayBuffer(f);}
   }
 };
+
+autoBootFromQuery();
 </script>
 </body>
 </html>

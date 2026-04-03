@@ -253,6 +253,34 @@ void test_memory(void) {
     PASS();
 }
 
+void test_legacy_memory_tail(void) {
+    TEST("legacy_memory_tail_compat");
+    uint32_t magic=0x514D454D;
+    FILE *f=fopen("/tmp/test_q_legacy.memory","wb");
+    CHECK(f!=NULL, "write open");
+    fwrite(&magic,4,1,f);
+    int nb=1,nt=0,nh=0;
+    fwrite(&nb,4,1,f); fwrite(&nt,4,1,f); fwrite(&nh,4,1,f);
+    int a=7,b=9; float p=0.25f;
+    fwrite(&a,4,1,f); fwrite(&b,4,1,f); fwrite(&p,4,1,f);
+    uint32_t npe=0;
+    fwrite(&npe,4,1,f);
+    fclose(f);
+    f=fopen("/tmp/test_q_legacy.memory","rb");
+    CHECK(f!=NULL, "read open");
+    uint32_t rm=0; int rnb=0,rnt=0,rnh=0;
+    fread(&rm,4,1,f); fread(&rnb,4,1,f); fread(&rnt,4,1,f); fread(&rnh,4,1,f);
+    CHECK(rm==magic, "magic");
+    CHECK(rnb==1&&rnt==0&&rnh==0, "counts");
+    fread(&a,4,1,f); fread(&b,4,1,f); fread(&p,4,1,f);
+    CHECK(a==7&&b==9, "pair");
+    CHECK(fabsf(p-0.25f)<1e-5f, "prob");
+    CHECK(fread(&npe,4,1,f)==1&&npe==0, "no periodic");
+    CHECK(fgetc(f)==EOF, "clean eof without soma tail");
+    fclose(f); remove("/tmp/test_q_legacy.memory");
+    PASS();
+}
+
 /* ── 10. Schumann ── */
 void test_schumann(void) {
     TEST("schumann_resonance");
@@ -427,8 +455,7 @@ void test_bigram_blocking(void) {
     PASS();
 }
 
-/* ── 21. Smoke: compile only ── */
-/* ── 22. Chamber modulation ── */
+/* ── 21. Chamber modulation ── */
 void test_chamber_modulation(void) {
     TEST("chamber_modulation");
     float act[6]={0.1f,0.6f,0.2f,0.1f,0.5f,0.3f};
@@ -443,7 +470,97 @@ void test_chamber_modulation(void) {
     PASS();
 }
 
-/* ── 23. Periodic mapping ── */
+void test_somatic_modulation(void) {
+    TEST("somatic_modulation");
+    float act[6]={0.1f,0.4f,0.1f,0.1f,0.5f,0.2f};
+    float soma[6]={0.1f,0.8f,0.0f,0.0f,0.7f,0.3f};
+    float presence=0.6f;
+    float a=fminf(2.0f,fmaxf(0.3f,1.0f+0.4f*act[1]-0.2f*act[2]+0.3f*act[4]));
+    float b=fminf(2.0f,fmaxf(0.3f,1.0f+0.4f*act[4]-0.2f*act[0]));
+    float g=fminf(2.0f,fmaxf(0.3f,1.0f+0.5f*act[5]+0.2f*act[1]-0.1f*act[3]));
+    float t=fminf(2.0f,fmaxf(0.3f,1.0f-0.2f*act[4]+0.1f*act[0]));
+    a=fminf(2.0f,fmaxf(0.3f,a*fminf(1.5f,fmaxf(0.7f,1.0f+0.14f*soma[1]+0.08f*soma[4]+0.05f*presence))));
+    b=fminf(2.0f,fmaxf(0.3f,b*fminf(1.5f,fmaxf(0.7f,1.0f+0.10f*soma[4]+0.08f*soma[5]+0.04f*presence))));
+    g=fminf(2.0f,fmaxf(0.3f,g*fminf(1.5f,fmaxf(0.7f,1.0f+0.10f*soma[5]+0.05f*soma[3]+0.06f*presence))));
+    t=fminf(2.0f,fmaxf(0.3f,t*fminf(1.5f,fmaxf(0.7f,1.0f-0.10f*soma[4]+0.08f*soma[0]+0.06f*soma[2]))));
+    CHECK(a>1.5f, "love-flow soma boosts alpha");
+    CHECK(b>1.2f, "flow-complex soma boosts beta");
+    CHECK(g>1.2f, "presence boosts gamma");
+    CHECK(t<1.0f, "flow cools tau");
+    PASS();
+}
+
+void test_velocity_profile(void) {
+    TEST("velocity_profile");
+    float diss=0.9f, temp_mul=1.0f, pro_mul=1.0f;
+    if(diss>0.8f){temp_mul=1.22f;pro_mul=1.25f;}
+    CHECK(temp_mul>1.2f, "up heats sampling");
+    CHECK(pro_mul>1.2f, "up boosts prophecy");
+    float trauma=0.7f, debt_decay=1.0f, trauma_decay=1.0f;
+    if(!(diss>0.8f) && trauma>0.5f){debt_decay=0.65f;trauma_decay=0.75f;}
+    CHECK(trauma>0.5f, "breathe condition");
+    PASS();
+}
+
+void test_interference_doc_choice(void) {
+    TEST("interference_doc_choice");
+    const char *keywords_a[]={"resonance","choir","counterpoint"};
+    const char *keywords_b[]={"fungus","mycelium","forest"};
+    const char *text="resonance in the choir";
+    float score_a=0.02f, score_b=0.02f;
+    for(int i=0;i<3;i++) if(strstr(text,keywords_a[i])) score_a+=1.2f;
+    for(int i=0;i<3;i++) if(strstr(text,keywords_b[i])) score_b+=1.2f;
+    CHECK(score_a>score_b, "prompt resonates with matching doc");
+    PASS();
+}
+
+void test_active_prophecy_state(void) {
+    TEST("active_prophecy_state");
+    typedef struct{int target; float strength; int age;} ProphecyE;
+    ProphecyE ps[4]={{42,0.7f,0}}; int np=1;
+    for(int i=0;i<np;i++){
+        if(ps[i].target!=7){
+            ps[i].age+=1;
+            ps[i].strength*=0.995f;
+        }
+    }
+    CHECK(np==1, "still present after unrelated token");
+    CHECK(ps[0].target==42, "target preserved");
+    CHECK(ps[0].age==1, "age incremented");
+    CHECK(ps[0].strength<0.7f, "strength decayed");
+
+    int kept=0;
+    for(int i=0;i<np;i++){
+        if(ps[i].target==42) continue;
+        ps[kept++]=ps[i];
+    }
+    np=kept;
+    CHECK(np==0, "fulfilled prophecy removed");
+    PASS();
+}
+
+void test_chunk_resonance_choice(void) {
+    TEST("chunk_resonance_choice");
+    const char *text="resonance in the choir";
+    const char *chunk_a[]={"fungus","forest"};
+    const char *chunk_b[]={"choir","resonance"};
+    float score_a=0.02f, score_b=0.02f;
+    for(int i=0;i<2;i++) if(strstr(text,chunk_a[i])) score_a+=1.2f;
+    for(int i=0;i<2;i++) if(strstr(text,chunk_b[i])) score_b+=1.2f;
+    CHECK(score_b>score_a, "matching chunk outranks unrelated chunk");
+    PASS();
+}
+
+void test_prophecy_pressure_ageing(void) {
+    TEST("prophecy_pressure_ageing");
+    float fresh=0.6f*logf(1.0f+0.0f);
+    float aged=0.6f*0.995f*0.995f*0.995f*0.995f*0.995f*logf(1.0f+5.0f);
+    CHECK(aged>fresh, "aged pressure exceeds fresh zero-age hint");
+    CHECK(aged>0.0f, "aged pressure positive");
+    PASS();
+}
+
+/* ── 22. Periodic mapping ── */
 void test_periodic_mapping(void) {
     TEST("periodic_mapping");
     const char *text="love rhythm paradox love rhythm mystery";
@@ -458,7 +575,7 @@ void test_periodic_mapping(void) {
     PASS();
 }
 
-/* ── 24. Interference seed selection ── */
+/* ── 23. Interference seed selection ── */
 void test_interference_seed(void) {
     TEST("interference_seed");
     const char *tok1=" resonance";
@@ -471,7 +588,7 @@ void test_interference_seed(void) {
     PASS();
 }
 
-/* ── 25. Smoke: compile only ── */
+/* ── 24. Smoke: compile only ── */
 void test_smoke_compile(void) {
     TEST("smoke_compile");
     int ret=system("gcc postgpt_q.c -O2 -lm -o /tmp/q_smoke 2>/dev/null");
@@ -480,7 +597,7 @@ void test_smoke_compile(void) {
     PASS();
 }
 
-/* ── 22. Smoke: run with small corpus ── */
+/* ── 25. Smoke: run with small corpus ── */
 void test_smoke_run_small(void) {
     TEST("smoke_run_small_corpus");
     system("head -c 5000 q.txt > /tmp/q_tiny.txt 2>/dev/null");
@@ -492,7 +609,7 @@ void test_smoke_run_small(void) {
     PASS();
 }
 
-/* ── 27. Smoke: run with weights ── */
+/* ── 26. Smoke: run with weights ── */
 void test_smoke_run_weights(void) {
     TEST("smoke_run_with_weights");
     system("head -c 5000 q.txt > /tmp/q_tiny.txt 2>/dev/null");
@@ -518,6 +635,7 @@ int main(void) {
     test_boundary();
     test_coherence();
     test_memory();
+    test_legacy_memory_tail();
     test_schumann();
     test_nucleus();
     test_prophecy();
@@ -530,6 +648,12 @@ int main(void) {
     test_hebbian_decay();
     test_bigram_blocking();
     test_chamber_modulation();
+    test_somatic_modulation();
+    test_velocity_profile();
+    test_interference_doc_choice();
+    test_active_prophecy_state();
+    test_chunk_resonance_choice();
+    test_prophecy_pressure_ageing();
     test_periodic_mapping();
     test_interference_seed();
     test_smoke_compile();

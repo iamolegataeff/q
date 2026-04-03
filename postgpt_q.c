@@ -28,6 +28,7 @@
 #define MAX_BIGRAM   65536
 #define MAX_TRIGRAM  65536
 #define MAX_HEBBIAN  131072
+#define MAX_PROPHECY 32
 #define N_CHAMBERS   6
 #define CHAIN_STEPS  12
 #define TOP_K        15
@@ -36,6 +37,9 @@
 #define MAX_PERIODIC 4096
 #define MAX_INTERF_DOCS 32
 #define MAX_HEAVY 32
+#define MAX_DOC_CHUNKS 8
+enum{VEL_WALK=0,VEL_RUN,VEL_STOP,VEL_BREATHE,VEL_UP,VEL_DOWN};
+static const char *VEL_N[]={"WALK","RUN","STOP","BREATHE","UP","DOWN"};
 
 /* ── math ── */
 static float clampf(float x, float lo, float hi) { return x<lo?lo:x>hi?hi:x; }
@@ -126,11 +130,13 @@ static int bpe_decode_token(const BPE *bpe, int id, char *buf, int sz){
 typedef struct{int a,b;float prob;}BigramE;
 typedef struct{int a,b,c;float prob;}TrigramE;
 typedef struct{int a,b;float str;}HebbE;
+typedef struct{int target;float strength;int age;}ProphecyE;
 typedef struct{
     float unigram[MAX_VOCAB];
     BigramE bigrams[MAX_BIGRAM]; int n_bi;
     TrigramE trigrams[MAX_TRIGRAM]; int n_tri;
     HebbE hebbs[MAX_HEBBIAN]; int n_hebb;
+    ProphecyE prophecies[MAX_PROPHECY]; int n_prophecy;
 }MetaW;
 
 static void meta_build(MetaW *mw, const int *ids, int n, int V){
@@ -226,8 +232,42 @@ static void meta_prophecy(const MetaW *mw, const int *ctx, int cl, float *out, i
             }
         }
     }
+    for(int i=0;i<mw->n_prophecy;i++){
+        int target=mw->prophecies[i].target;
+        if(target>=0&&target<V&&!appeared[target%256])
+            out[target]+=mw->prophecies[i].strength*logf(1.0f+(float)mw->prophecies[i].age);
+    }
     float mx=0; for(int i=0;i<V;i++) if(out[i]>mx) mx=out[i];
     if(mx>0) for(int i=0;i<V;i++) out[i]/=mx;
+}
+static void prophecy_add(MetaW *mw, int target, float strength){
+    if(target<0) return;
+    for(int i=0;i<mw->n_prophecy;i++) if(mw->prophecies[i].target==target){
+        if(strength>mw->prophecies[i].strength) mw->prophecies[i].strength=strength;
+        mw->prophecies[i].age=0; return;
+    }
+    if(mw->n_prophecy>=MAX_PROPHECY){
+        int oldest=0;
+        for(int i=1;i<mw->n_prophecy;i++) if(mw->prophecies[i].age>mw->prophecies[oldest].age) oldest=i;
+        mw->prophecies[oldest]=mw->prophecies[--mw->n_prophecy];
+    }
+    mw->prophecies[mw->n_prophecy++] = (ProphecyE){target,strength,0};
+}
+static void prophecy_update(MetaW *mw, int token){
+    int w=0;
+    for(int i=0;i<mw->n_prophecy;i++){
+        ProphecyE p=mw->prophecies[i];
+        if(p.target==token) continue;
+        p.age++;
+        p.strength*=0.995f;
+        if(p.age<50&&p.strength>0.01f) mw->prophecies[w++]=p;
+    }
+    mw->n_prophecy=w;
+}
+static float prophecy_pressure(const MetaW *mw){
+    float total=0;
+    for(int i=0;i<mw->n_prophecy;i++) total+=mw->prophecies[i].strength*logf(1.0f+(float)mw->prophecies[i].age);
+    return clampf(total/4.0f,0,1);
 }
 
 static void ingest_ids(MetaW *mw, const int *ids, int n, float amount){
@@ -299,6 +339,10 @@ static const SomaticSeed SOMATIC_SEEDS[]={
 typedef struct{char word[32]; int chamber; float mass;}PeriodicElement;
 typedef struct{PeriodicElement elements[MAX_PERIODIC]; int n;}PeriodicTable;
 typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;}Chambers;
+typedef struct{
+    int mode; float temp_mul,heb_mul,pro_mul,ds_mul,bg_mul,tg_mul;
+    float interf_bonus,wormhole_bonus,debt_decay,trauma_decay;
+}VelocityProfile;
 
 static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
 static void ch_xfire(Chambers *c, int it){
@@ -406,44 +450,85 @@ static void ch_summary(const Chambers *c, char *buf, int sz){
     if(c->presence>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSOMA:%.0f%%",pos?" ":"",c->presence*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(pos==0) snprintf(buf,sz,"quiet");
 }
+static VelocityProfile velocity_profile(const Chambers *c, float dissonance){
+    VelocityProfile vp={VEL_WALK,1,1,1,1,1,1,0,0,1,1};
+    if(dissonance>0.8f) vp.mode=VEL_UP;
+    else if(dissonance>0.6f) vp.mode=VEL_RUN;
+    else if(dissonance<0.2f) vp.mode=VEL_STOP;
+    else if(c->trauma>0.5f) vp.mode=VEL_BREATHE;
+    else if(c->debt>0.55f) vp.mode=VEL_DOWN;
+    if(vp.mode==VEL_RUN){vp.temp_mul=1.12f;vp.bg_mul=1.15f;vp.interf_bonus=0.05f;}
+    else if(vp.mode==VEL_STOP){vp.temp_mul=0.72f;vp.ds_mul=1.25f;vp.debt_decay=0.75f;}
+    else if(vp.mode==VEL_BREATHE){vp.temp_mul=0.9f;vp.debt_decay=0.65f;vp.trauma_decay=0.75f;}
+    else if(vp.mode==VEL_UP){vp.temp_mul=1.22f;vp.pro_mul=1.25f;vp.bg_mul=0.9f;vp.interf_bonus=0.1f;vp.wormhole_bonus=0.05f;}
+    else if(vp.mode==VEL_DOWN){vp.temp_mul=0.82f;vp.heb_mul=1.1f;vp.bg_mul=1.1f;vp.pro_mul=0.9f;}
+    return vp;
+}
 
-static float compute_dissonance(const MetaW *mw, const int *ids, int n, int V){
-    if(n<=1) return 0.5f;
-    int known=0;
-    for(int i=0;i<n-1;i++){
-        int a=ids[i],b=ids[i+1];
-        for(int j=0;j<mw->n_bi;j++){
-            if(mw->bigrams[j].a==a&&mw->bigrams[j].b==b){known++;break;}
+typedef struct{int start; int heavy[MAX_HEAVY]; int n_heavy; char keywords[16][32]; int n_keywords;}InterferenceChunk;
+typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy; char keywords[16][32]; int n_keywords; InterferenceChunk chunks[MAX_DOC_CHUNKS]; int n_chunks;}InterferenceDoc;
+typedef struct{InterferenceDoc docs[MAX_INTERF_DOCS]; int n_docs;}Interference;
+
+static void interf_summarize_ids(const int *ids, int n, const BPE *bpe,
+                                 int *heavy, int *n_heavy,
+                                 char keywords[][32], int *n_keywords,
+                                 int heavy_cap, int kw_cap){
+    MetaW tmp; meta_build(&tmp,ids,n,bpe->vocab_size);
+    int toks[512], cnts[512], nt=0;
+    for(int i=0;i<tmp.n_bi&&nt<512;i++){
+        int pair[2]={tmp.bigrams[i].a,tmp.bigrams[i].b};
+        for(int pi=0;pi<2;pi++){
+            int tok=pair[pi],found=-1;
+            for(int j=0;j<nt;j++) if(toks[j]==tok){found=j;break;}
+            if(found>=0) cnts[found]++;
+            else if(nt<512){toks[nt]=tok;cnts[nt]=1;nt++;}
         }
     }
-    float ratio=(float)known/(float)(n-1);
-    return clampf(1.0f-ratio,0.0f,1.0f);
-}
-
-enum{VEL_STOP=0,VEL_WALK,VEL_RUN,VEL_UP};
-static int auto_velocity(float dissonance){
-    if(dissonance<0.2f) return VEL_STOP;
-    if(dissonance<0.5f) return VEL_WALK;
-    if(dissonance<0.8f) return VEL_RUN;
-    return VEL_UP;
-}
-
-static void apply_velocity(int vel, float *am, float *bm, float *gm, float *tm, float *temp){
-    switch(vel){
-        case VEL_STOP: *am*=0.1f; break;
-        case VEL_WALK: break;
-        case VEL_RUN:  *am*=1.5f; *bm*=1.2f; break;
-        case VEL_UP:   *bm*=2.0f; *gm*=2.5f; break;
+    *n_heavy=0; *n_keywords=0;
+    for(int pick=0;pick<nt&&*n_heavy<heavy_cap;pick++){
+        int best=-1;
+        for(int i=0;i<nt;i++) if(cnts[i]>=0&&(best<0||cnts[i]>cnts[best]||(cnts[i]==cnts[best]&&toks[i]<toks[best]))) best=i;
+        if(best<0) break;
+        int tok=toks[best]; cnts[best]=-1;
+        char buf[64]; bpe_decode_token(bpe,tok,buf,sizeof(buf));
+        int alpha=0; for(int j=0;buf[j];j++) if(isalpha((unsigned char)buf[j])) alpha++;
+        if(alpha<=2) continue;
+        heavy[(*n_heavy)++]=tok;
+        if(*n_keywords<kw_cap){
+            for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+            strncpy(keywords[*n_keywords],buf,31);
+            keywords[*n_keywords][31]=0;
+            (*n_keywords)++;
+        }
     }
-    /* dissonance-based temperature nudge */
-    if(vel>=VEL_RUN) *temp=clampf(*temp+0.08f,0.4f,0.85f);
-    if(vel==VEL_STOP) *temp=clampf(*temp-0.05f,0.4f,0.85f);
-    *am=clampf(*am,0.3f,2.0f); *bm=clampf(*bm,0.3f,2.0f);
-    *gm=clampf(*gm,0.3f,2.0f); *tm=clampf(*tm,0.3f,2.0f);
+    if(*n_heavy==0){
+        int lim=n<heavy_cap?n:heavy_cap;
+        for(int i=0;i<lim;i++) heavy[(*n_heavy)++]=ids[i];
+    }
 }
 
-typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy;}InterferenceDoc;
-typedef struct{InterferenceDoc docs[MAX_INTERF_DOCS]; int n_docs;}Interference;
+static float interf_item_score(const int *heavy, int n_heavy, const char keywords[][32], int n_keywords,
+                               const char *text, int dom, const PeriodicTable *pt,
+                               const MetaW *mw, const BPE *bpe){
+    float score=0.01f*(float)n_heavy;
+    (void)heavy;
+    for(int ki=0;ki<n_keywords;ki++){
+        const char *word=keywords[ki];
+        if(text&&strstr(text,word)) score+=1.2f;
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(word,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) score+=0.6f;
+        if(pt){ int idx=periodic_find(pt,word); if(idx>=0&&pt->elements[idx].chamber==dom) score+=0.35f*pt->elements[idx].mass; }
+        if(mw&&bpe){
+            for(int pi=0;pi<mw->n_prophecy;pi++){
+                char pbuf[64]; bpe_decode_token(bpe,mw->prophecies[pi].target,pbuf,sizeof(pbuf));
+                for(int j=0;pbuf[j];j++) pbuf[j]=(char)tolower((unsigned char)pbuf[j]);
+                if(strcmp(word,pbuf)==0) score+=0.9f*mw->prophecies[pi].strength*logf(1.0f+(float)mw->prophecies[pi].age);
+            }
+        }
+    }
+    score+=0.05f*((float)rand()/RAND_MAX);
+    return score;
+}
+
 static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe){
     static const char *doc_names[]={
         "bach_counterpoint.txt","bioluminescence.txt","byzantine_iconography.txt",
@@ -456,18 +541,52 @@ static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe)
         fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
         uint8_t *raw=malloc(sz>0?sz:1); fread(raw,1,sz,f); fclose(f);
         int *ids=malloc((sz>0?sz:1)*sizeof(int)); int n=bpe_encode(bpe,raw,(int)sz,ids,(int)sz);
-        MetaW tmp; meta_build(&tmp,ids,n,bpe->vocab_size);
         InterferenceDoc *doc=&itf->docs[itf->n_docs];
         strncpy(doc->name,doc_names[di],sizeof(doc->name)-1);
-        for(int i=0;i<tmp.n_bi&&doc->n_heavy<MAX_HEAVY;i++){
-            int tok=tmp.bigrams[i].a,dup=0; char buf[64]; bpe_decode_token(bpe,tok,buf,sizeof(buf));
-            for(int j=0;j<doc->n_heavy;j++) if(doc->heavy[j]==tok){dup=1;break;}
-            int alpha=0; for(int j=0;buf[j];j++) if(isalpha((unsigned char)buf[j])) alpha++;
-            if(!dup&&alpha>2) doc->heavy[doc->n_heavy++]=tok;
+        interf_summarize_ids(ids,n,bpe,doc->heavy,&doc->n_heavy,doc->keywords,&doc->n_keywords,MAX_HEAVY,16);
+        for(int start=0;start<n&&doc->n_chunks<MAX_DOC_CHUNKS;start+=32){
+            int part_n=(n-start)>64?64:(n-start);
+            if(part_n<12) continue;
+            InterferenceChunk *chunk=&doc->chunks[doc->n_chunks];
+            memset(chunk,0,sizeof(*chunk));
+            chunk->start=start;
+            interf_summarize_ids(ids+start,part_n,bpe,chunk->heavy,&chunk->n_heavy,chunk->keywords,&chunk->n_keywords,16,8);
+            if(chunk->n_heavy>0) doc->n_chunks++;
+        }
+        if(doc->n_chunks==0&&doc->n_heavy>0){
+            InterferenceChunk *chunk=&doc->chunks[doc->n_chunks++];
+            memset(chunk,0,sizeof(*chunk));
+            chunk->start=0;
+            chunk->n_heavy=doc->n_heavy<16?doc->n_heavy:16;
+            memcpy(chunk->heavy,doc->heavy,chunk->n_heavy*sizeof(int));
+            chunk->n_keywords=doc->n_keywords<8?doc->n_keywords:8;
+            for(int i=0;i<chunk->n_keywords;i++){strncpy(chunk->keywords[i],doc->keywords[i],31); chunk->keywords[i][31]=0;}
         }
         if(doc->n_heavy>0) itf->n_docs++;
         free(ids); free(raw);
     }
+}
+static const InterferenceDoc *interf_choose_doc(const Interference *itf, const char *text, const Chambers *c, const PeriodicTable *pt, const MetaW *mw, const BPE *bpe){
+    if(!itf||itf->n_docs<=0) return NULL;
+    int dom=c?ch_dominant(c):CH_FLOW;
+    const InterferenceDoc *best=&itf->docs[rand()%itf->n_docs]; float best_score=-1e30f;
+    for(int di=0;di<itf->n_docs;di++){
+        const InterferenceDoc *doc=&itf->docs[di];
+        float score=interf_item_score(doc->heavy,doc->n_heavy,doc->keywords,doc->n_keywords,text,dom,pt,mw,bpe);
+        if(score>best_score){best_score=score;best=doc;}
+    }
+    return best;
+}
+static const InterferenceChunk *interf_choose_chunk(const InterferenceDoc *doc, const char *text, const Chambers *c, const PeriodicTable *pt, const MetaW *mw, const BPE *bpe){
+    if(!doc||doc->n_chunks<=0) return NULL;
+    int dom=c?ch_dominant(c):CH_FLOW;
+    const InterferenceChunk *best=&doc->chunks[0]; float best_score=-1e30f;
+    for(int ci=0;ci<doc->n_chunks;ci++){
+        const InterferenceChunk *chunk=&doc->chunks[ci];
+        float score=interf_item_score(chunk->heavy,chunk->n_heavy,chunk->keywords,chunk->n_keywords,text,dom,pt,mw,bpe);
+        if(score>best_score){best_score=score;best=chunk;}
+    }
+    return best;
 }
 static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
     if(!itf||itf->n_docs<=0) return -1;
@@ -482,6 +601,50 @@ static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bp
         if(sc>best_score){best_score=sc;best=doc->heavy[i];}
     }
     return best;
+}
+static int interf_seed_from_doc(const InterferenceDoc *doc, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
+    if(!doc||doc->n_heavy<=0) return -1;
+    int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
+    for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
+        for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
+        if(pt){ int idx=periodic_find(pt,buf); if(idx>=0&&pt->elements[idx].chamber==dom) sc+=0.5f*pt->elements[idx].mass; }
+        if(sc>best_score){best_score=sc;best=doc->heavy[i];}
+    }
+    return best;
+}
+static int interf_seed_from_chunk(const InterferenceChunk *chunk, const Chambers *c, const BPE *bpe, const PeriodicTable *pt){
+    if(!chunk||chunk->n_heavy<=0) return -1;
+    int dom=ch_dominant(c),best=chunk->heavy[rand()%chunk->n_heavy]; float best_score=-1e30f;
+    for(int i=0;i<chunk->n_heavy&&i<MAX_HEAVY;i++){
+        char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,chunk->heavy[i],buf,sizeof(buf));
+        for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
+        for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
+        if(pt){ int idx=periodic_find(pt,buf); if(idx>=0&&pt->elements[idx].chamber==dom) sc+=0.5f*pt->elements[idx].mass; }
+        if(sc>best_score){best_score=sc;best=chunk->heavy[i];}
+    }
+    return best;
+}
+static void interf_signal(const InterferenceDoc *doc, float *out, int V){
+    for(int i=0;i<V;i++) out[i]=0;
+    if(!doc) return;
+    float mx=0;
+    for(int rank=0;rank<doc->n_heavy&&rank<16;rank++){
+        int tid=doc->heavy[rank];
+        if(tid>=0&&tid<V){out[tid]+=1.0f/(1.0f+(float)rank); if(out[tid]>mx) mx=out[tid];}
+    }
+    if(mx>1e-8f) for(int i=0;i<V;i++) out[i]/=mx;
+}
+static void interf_signal_chunk(const InterferenceChunk *chunk, float *out, int V){
+    for(int i=0;i<V;i++) out[i]=0;
+    if(!chunk) return;
+    float mx=0;
+    for(int rank=0;rank<chunk->n_heavy&&rank<16;rank++){
+        int tid=chunk->heavy[rank];
+        if(tid>=0&&tid<V){out[tid]+=1.0f/(1.0f+(float)rank); if(out[tid]>mx) mx=out[tid];}
+    }
+    if(mx>1e-8f) for(int i=0;i<V;i++) out[i]/=mx;
 }
 
 /* ── DOE Parliament — Democracy of Experts ── */
@@ -791,7 +954,7 @@ static int starts_with_space(const BPE *bpe, int id){
 static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
                     const int *prompt, int plen, float temp,
                     int *out, int maxo, Parliament *parl, float *global_destiny,
-                    Chambers *ch_ptr, int somatic_vel){
+                    Chambers *ch_ptr, const VelocityProfile *vel, const float *doc_signal){
     tf_reset(t); int V=t->V,D=t->D;
     float *destiny=calloc(D,sizeof(float));
     /* inherit global destiny direction (thematic coherence across chain) */
@@ -801,7 +964,6 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
     int ctx[MAX_SEQ],cl=0,gl=0;
     float am=1.0f,bm=1.0f,gm=1.0f,tm=1.0f;
     if(ch_ptr) ch_modulate(ch_ptr,&am,&bm,&gm,&tm);
-    apply_velocity(somatic_vel,&am,&bm,&gm,&tm,&temp);
     for(int i=0;i<plen&&i<t->CTX-1;i++){tf_forward(t,prompt[i],i);ctx[cl++]=prompt[i];out[gl++]=prompt[i];}
     for(int step=0;step<120&&gl<maxo;step++){
         int pos=cl-1; if(pos>=t->CTX-1) break;
@@ -843,6 +1005,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         float *pro=calloc(V,sizeof(float));
         int hs=cl>8?cl-8:0; meta_hebb(mw,ctx+hs,cl-hs,heb,V);
         meta_prophecy(mw,ctx,cl,pro,V);
+        float p_debt=prophecy_pressure(mw);
         /* trauma gravity: high trauma dampens all logits */
         if(ch_ptr&&ch_ptr->trauma>0.1f)
             for(int i=0;i<V;i++) raw[i]/=(1.0f+ch_ptr->trauma);
@@ -852,6 +1015,8 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
         /* Dario field: B + α·H + β·P + γ·D + T — stronger without weights */
         float c_heb=(has_tf?0.6f:1.0f)*am, c_pro=(has_tf?0.4f:0.7f)*bm;
         float c_ds=(has_tf?0.3f:0.15f)*gm, c_bg=has_tf?5.0f:15.0f, c_tg=has_tf?3.0f:10.0f;
+        if(vel){c_heb*=vel->heb_mul;c_pro*=vel->pro_mul*(1.0f+0.35f*p_debt);c_ds*=vel->ds_mul;c_bg*=vel->bg_mul;c_tg*=vel->tg_mul;}
+        float c_doc=has_tf?0.18f:0.32f;
         for(int i=0;i<V;i++){
             float bg=meta_bi(mw,ctx[cl-1],i);
             float tg=cl>=2?meta_tri(mw,ctx[cl-2],ctx[cl-1],i):1e-10f;
@@ -859,6 +1024,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
             if(dn>1e-8f){float en=0;for(int d=0;d<D;d++) en+=t->tok[i*D+d]*t->tok[i*D+d];
                 en=sqrtf(en+1e-10f);if(en>1e-8f){float dot=0;for(int d=0;d<D;d++) dot+=destiny[d]*t->tok[i*D+d];ds=dot/(dn*en);}}
             raw[i]+=c_heb*heb[i]+c_pro*pro[i]+c_ds*ds+c_bg*bg+c_tg*tg;
+            if(doc_signal) raw[i]+=c_doc*doc_signal[i];
             if(mw->unigram[i]<1e-6f) raw[i]-=2.0f;
             else if(mw->unigram[i]>0.01f) raw[i]-=0.3f*(mw->unigram[i]-0.01f)*100.0f;
         }
@@ -882,10 +1048,11 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
             }else{ch=sample_nucleus(raw,V,0.5f,0.7f);}
         }else if(step<4){
             ch=0;float mx=raw[0];for(int i=1;i<V;i++) if(raw[i]>mx){mx=raw[i];ch=i;}
-        }else{ch=sample_nucleus(raw,V,clampf(temp*tm,0.3f,1.2f),0.85f);}
+        }else{float vm=vel?vel->temp_mul:1.0f;ch=sample_nucleus(raw,V,clampf(temp*tm*vm,0.25f,1.35f),0.85f);}
         free(raw);
         prev_chosen=ch;
         out[gl++]=ch; ctx[cl++]=ch;
+        prophecy_update(mw,ch);
         /* word capture: online MetaWeight update (NOTORCH) */
         if(cl>=2){
             int prev=ctx[cl-2],cur=ctx[cl-1];
@@ -895,6 +1062,10 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
             }
             if(mw->n_bi<MAX_BIGRAM){mw->bigrams[mw->n_bi].a=prev;mw->bigrams[mw->n_bi].b=cur;mw->bigrams[mw->n_bi].prob=0.01f;mw->n_bi++;}
             bi_done:;
+            {int best_pred=-1; float best_prob=0;
+            for(int i=0;i<mw->n_tri;i++) if(mw->trigrams[i].a==prev&&mw->trigrams[i].b==cur&&mw->trigrams[i].prob>best_prob){best_prob=mw->trigrams[i].prob;best_pred=mw->trigrams[i].c;}
+            if(best_pred<0) for(int i=0;i<mw->n_bi;i++) if(mw->bigrams[i].a==cur&&mw->bigrams[i].prob>best_prob){best_prob=mw->bigrams[i].prob;best_pred=mw->bigrams[i].b;}
+            if(best_pred>=0) prophecy_add(mw,best_pred,0.2f+0.5f*best_prob);}
             /* update Hebbian: co-occurrence with recent window */
             int hw=cl>6?cl-6:0;
             for(int ri=hw;ri<cl-1;ri++){
@@ -985,22 +1156,20 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     int nb=(int)(CHAIN_STEPS*(0.3f+0.4f*ch->debt+0.1f*cd));
     if(nb<1)nb=1;if(nb>=CHAIN_STEPS)nb=CHAIN_STEPS-1;
 
-    /* somatic dissonance + velocity (micro-Klaus sonar) */
-    float somatic_diss=0.5f; int somatic_vel=VEL_WALK;
     if(input_text&&input_text[0]){
         int uids[512]; int ulen=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),uids,512);
         ingest_ids(mw,uids,ulen,0.02f);
         ch_feel_text(ch,input_text,pt);
-        somatic_diss=compute_dissonance(mw,uids,ulen,t->V);
-        somatic_vel=auto_velocity(somatic_diss);
         ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]+0.1f,0,1);
         ch_xfire(ch,8);
     }
+    VelocityProfile vel=velocity_profile(ch,cd);
+    ch->debt=clampf((0.88f*ch->debt+0.12f*prophecy_pressure(mw))*vel.debt_decay,0,1);
+    ch->trauma=clampf(ch->trauma*vel.trauma_decay,0,1);
 
     char chbuf[256];
     ch_summary(ch,chbuf,sizeof(chbuf));
-    static const char *VEL_N[]={"STOP","WALK","RUN","UP"};
-    printf("\n  diss=%.3f debt=%.3f emrg=%.3f somatic_d=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch_emergence(ch),somatic_diss,VEL_N[somatic_vel],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
+    printf("\n  diss=%.3f debt=%.3f emrg=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch_emergence(ch),VEL_N[vel.mode],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
     if(parl) {float av=0;for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality;av/=(parl->n>0?parl->n:1);
         printf("\n  parliament: %d experts, avg_vitality=%.2f",parl->n,av);}
     if(itf&&itf->n_docs>0) printf("\n  interference: %d docs loaded",itf->n_docs);
@@ -1011,9 +1180,20 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     int chain_ids[CHAIN_STEPS][256]; int chain_lens[CHAIN_STEPS];
     for(int si=0;si<CHAIN_STEPS;si++){
         int dir=si<nb?-1:(si==nb?0:1);
+        const InterferenceDoc *active_doc=(itf&&itf->n_docs>0)?interf_choose_doc(itf,input_text,ch,pt,mw,bpe):NULL;
+        const InterferenceChunk *active_chunk=active_doc?interf_choose_chunk(active_doc,input_text,ch,pt,mw,bpe):NULL;
+        float *doc_signal=NULL;
+        if(active_chunk){
+            doc_signal=calloc(t->V,sizeof(float));
+            interf_signal_chunk(active_chunk,doc_signal,t->V);
+            if(active_chunk->n_heavy>0){
+                int seed_tok=active_chunk->heavy[0];
+                if(seed_tok>=0&&seed_tok<t->V) for(int d=0;d<t->D;d++) gdest[d]=0.97f*gdest[d]+0.03f*t->tok[seed_tok*t->D+d];
+            }
+        }
         int prompt[5]={0},plen=0,used_interf=0;
-        if(itf&&itf->n_docs>0&&((float)rand()/RAND_MAX)<0.3f){
-            int seed=interf_seed(itf,ch,bpe,pt);
+        if(itf&&itf->n_docs>0&&((float)rand()/RAND_MAX)<clampf(0.3f+vel.interf_bonus,0.05f,0.5f)){
+            int seed=active_chunk?interf_seed_from_chunk(active_chunk,ch,bpe,pt):(active_doc?interf_seed_from_doc(active_doc,ch,bpe,pt):interf_seed(itf,ch,bpe,pt));
             if(seed>=0){prompt[0]=seed;plen=1;used_interf=1;}
         }
         if(plen==0&&input_text&&input_text[0]){
@@ -1053,13 +1233,13 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float schumann=0.4f*sinf(2*M_PI*7.83f*t_sec)+0.2f*sinf(2*M_PI*14.3f*t_sec)
                        +0.1f*sinf(2*M_PI*20.8f*t_sec)+0.05f*sinf(2*M_PI*27.3f*t_sec);
         float base_temp=has_weights?0.6f:0.75f;
-        float temp=clampf(base_temp+0.08f*schumann,0.4f,0.85f);
+        float temp=clampf((base_temp+0.08f*schumann)*vel.temp_mul,0.35f,0.95f);
         /* best-of-3: generate 3 candidates, pick highest coherence */
         int best_out[256],best_ol=0; float best_sc=-1e30f;
         float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
         for(int cand=0;cand<3;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,somatic_vel);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,&vel,doc_signal);
             float sc=coherence_score(mw,out,ol,t->V);
             if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
             if(best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
@@ -1068,6 +1248,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         if(si<CHAIN_STEPS-1){
             float wh_prob=0.02f;
             if(cd>0.3f) wh_prob+=((cd-0.3f)/0.7f)*0.15f;
+            wh_prob=clampf(wh_prob+vel.wormhole_bonus,0,0.3f);
             wormhole=((float)rand()/RAND_MAX)<wh_prob;
             if(wormhole&&itf&&itf->n_docs>0){
                 const InterferenceDoc *doc=&itf->docs[0];
@@ -1075,7 +1256,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                 if(doc->n_heavy>0){
                     int wh_prompt[1]={doc->heavy[rand()%doc->n_heavy]};
                     dir=dir!=0?-dir:1;
-                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,somatic_vel);
+                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,&vel,doc_signal);
                     best_sc=coherence_score(mw,best_out,best_ol,t->V);
                 }
             }
@@ -1097,7 +1278,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         }
         /* save for SPA */
         chain_lens[si]=best_ol; memcpy(chain_ids[si],best_out,best_ol*sizeof(int));
-        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f;
+        ch_xfire(ch,3); ch->debt=0.9f*ch->debt+0.05f; if(doc_signal) free(doc_signal);
     }
     /* SPA: iterative cross-attention — reseed weak sentences, verify improvement */
     float spa_embs[CHAIN_STEPS][SPA_DIM]; float spa_scores[CHAIN_STEPS];
@@ -1114,7 +1295,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             int seed_src=weak_idx>0?weak_idx-1:(weak_idx<CHAIN_STEPS-1?weak_idx+1:0);
             int nprom=chain_lens[seed_src]>3?3:chain_lens[seed_src];
             int prompt[5]; for(int i=0;i<nprom;i++) prompt[i]=chain_ids[seed_src][chain_lens[seed_src]-nprom+i];
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,somatic_vel);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,&vel,NULL);
             float new_sc=coherence_score(mw,out,ol,t->V);
             float old_sc=coherence_score(mw,chain_ids[weak_idx],chain_lens[weak_idx],t->V);
             if(new_sc>old_sc*0.7f||ol>chain_lens[weak_idx]){ /* accept if reasonable */

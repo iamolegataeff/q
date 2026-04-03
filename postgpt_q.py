@@ -29,6 +29,7 @@ MAX_SEQ     = 4096
 MAX_BIGRAM  = 65536
 MAX_TRIGRAM = 65536
 MAX_HEBBIAN = 131072
+MAX_PROPHECY = 32
 N_CHAMBERS  = 6
 CHAIN_STEPS = 12
 TOP_K       = 15
@@ -41,6 +42,13 @@ SPA_HD      = SPA_DIM // SPA_NH
 MAX_EXPERTS = 16
 DOE_RANK    = 4
 DOE_ALPHA   = 0.05
+VEL_WALK    = 0
+VEL_RUN     = 1
+VEL_STOP    = 2
+VEL_BREATHE = 3
+VEL_UP      = 4
+VEL_DOWN    = 5
+VEL_N = ["WALK", "RUN", "STOP", "BREATHE", "UP", "DOWN"]
 
 # ── chamber indices ──
 CH_FEAR  = 0
@@ -238,6 +246,7 @@ class MetaW:
         self.n_tri = 0
         self.hebbs = []       # list of [a, b, str]
         self.n_hebb = 0
+        self.prophecies = []  # list of [target, strength, age]
 class PeriodicTable:
     def __init__(self):
         self.elements = {}
@@ -412,6 +421,9 @@ def meta_prophecy(mw, ctx, cl, V):
             if (mw.trigrams[k][0] == p0 and mw.trigrams[k][1] == p1
                     and mw.trigrams[k][2] < V and not appeared[mw.trigrams[k][2] % 256]):
                 out[mw.trigrams[k][2]] += mw.trigrams[k][3] * 1.5  # trigrams are more specific
+    for target, strength, age in mw.prophecies:
+        if 0 <= target < V and not appeared[target % 256]:
+            out[target] += strength * math.log1p(float(age))
     mx = 0.0
     for i in range(V):
         if out[i] > mx:
@@ -420,6 +432,33 @@ def meta_prophecy(mw, ctx, cl, V):
         for i in range(V):
             out[i] /= mx
     return out
+def prophecy_add(mw, target, strength):
+    if target < 0:
+        return
+    for item in mw.prophecies:
+        if item[0] == target:
+            item[1] = max(item[1], strength)
+            item[2] = 0
+            return
+    if len(mw.prophecies) >= MAX_PROPHECY:
+        oldest = max(range(len(mw.prophecies)), key=lambda i: mw.prophecies[i][2])
+        mw.prophecies.pop(oldest)
+    mw.prophecies.append([target, strength, 0])
+def prophecy_update(mw, token):
+    kept = []
+    for target, strength, age in mw.prophecies:
+        if target == token:
+            continue
+        age += 1
+        strength *= 0.995
+        if age < 50 and strength > 0.01:
+            kept.append([target, strength, age])
+    mw.prophecies = kept
+def prophecy_pressure(mw):
+    total = 0.0
+    for _target, strength, age in mw.prophecies:
+        total += strength * math.log1p(float(age))
+    return clampf(total / 4.0, 0.0, 1.0)
 def ingest_ids(mw, ids, amount=0.02):
     ulen = len(ids)
     if ulen <= 1:
@@ -653,47 +692,79 @@ def ch_xfire(c, it):
             c.act[i] = clampf(c.act[i], 0.0, 1.0)
             c.soma[i] = clampf(0.94 * c.soma[i] + 0.02 * c.act[i], 0.0, 1.0)
         c.presence = clampf(0.95 * c.presence + 0.03 * c.emergence(), 0.0, 1.0)
-# ── Dissonance & Velocity (micro-Klaus sonar) ──
-def compute_dissonance(mw, ids, V):
-    n = len(ids)
-    if n <= 1:
-        return 0.5
-    known = 0
-    for i in range(n - 1):
-        a, b = ids[i], ids[i + 1]
-        for bi in mw.bigrams:
-            if bi[0] == a and bi[1] == b:
-                known += 1
-                break
-    ratio = float(known) / float(n - 1)
-    return clampf(1.0 - ratio, 0.0, 1.0)
-VEL_STOP, VEL_WALK, VEL_RUN, VEL_UP = 0, 1, 2, 3
-VEL_NAMES = ["STOP", "WALK", "RUN", "UP"]
-def auto_velocity(dissonance):
-    if dissonance < 0.2:
-        return VEL_STOP
-    if dissonance < 0.5:
-        return VEL_WALK
-    if dissonance < 0.8:
-        return VEL_RUN
-    return VEL_UP
-def apply_velocity(vel, am, bm, gm, tm, temp):
-    if vel == VEL_STOP:
-        am *= 0.1
-    elif vel == VEL_RUN:
-        am *= 1.5; bm *= 1.2
-    elif vel == VEL_UP:
-        bm *= 2.0; gm *= 2.5
-    if vel >= VEL_RUN:
-        temp = clampf(temp + 0.08, 0.4, 0.85)
-    if vel == VEL_STOP:
-        temp = clampf(temp - 0.05, 0.4, 0.85)
-    am = clampf(am, 0.3, 2.0); bm = clampf(bm, 0.3, 2.0)
-    gm = clampf(gm, 0.3, 2.0); tm = clampf(tm, 0.3, 2.0)
-    return am, bm, gm, tm, temp
+def velocity_profile(ch, dissonance):
+    mode = VEL_WALK
+    if dissonance > 0.8:
+        mode = VEL_UP
+    elif dissonance > 0.6:
+        mode = VEL_RUN
+    elif dissonance < 0.2:
+        mode = VEL_STOP
+    elif ch.trauma > 0.5:
+        mode = VEL_BREATHE
+    elif ch.debt > 0.55:
+        mode = VEL_DOWN
+
+    prof = {
+        "mode": mode,
+        "name": VEL_N[mode],
+        "temp_mul": 1.0,
+        "heb_mul": 1.0,
+        "pro_mul": 1.0,
+        "ds_mul": 1.0,
+        "bg_mul": 1.0,
+        "tg_mul": 1.0,
+        "interf_bonus": 0.0,
+        "wormhole_bonus": 0.0,
+        "debt_decay": 1.0,
+        "trauma_decay": 1.0,
+    }
+    if mode == VEL_RUN:
+        prof["temp_mul"] = 1.12
+        prof["bg_mul"] = 1.15
+        prof["interf_bonus"] = 0.05
+    elif mode == VEL_STOP:
+        prof["temp_mul"] = 0.72
+        prof["ds_mul"] = 1.25
+        prof["debt_decay"] = 0.75
+    elif mode == VEL_BREATHE:
+        prof["temp_mul"] = 0.9
+        prof["debt_decay"] = 0.65
+        prof["trauma_decay"] = 0.75
+    elif mode == VEL_UP:
+        prof["temp_mul"] = 1.22
+        prof["pro_mul"] = 1.25
+        prof["bg_mul"] = 0.9
+        prof["wormhole_bonus"] = 0.05
+        prof["interf_bonus"] = 0.1
+    elif mode == VEL_DOWN:
+        prof["temp_mul"] = 0.82
+        prof["heb_mul"] = 1.1
+        prof["bg_mul"] = 1.1
+        prof["pro_mul"] = 0.9
+    return prof
 class Interference:
     def __init__(self):
         self.docs = []
+
+    def _summarize_ids(self, ids, bpe, heavy_limit=32, keyword_limit=16):
+        tmp = MetaW()
+        meta_build(tmp, ids, len(ids), bpe.vocab_size)
+        heavy = []
+        counts = {}
+        for a, b, _p in tmp.bigrams:
+            counts[a] = counts.get(a, 0) + 1
+            counts[b] = counts.get(b, 0) + 1
+        ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
+        keywords = []
+        for tok, _score in ranked:
+            dec = bpe_decode_token(bpe, tok).strip()
+            if len(dec) > 2 and any(ch.isalpha() for ch in dec):
+                heavy.append(tok)
+                keywords.append(dec.lower())
+            if len(heavy) >= heavy_limit:
+                break
+        return {"heavy": heavy or ids[:heavy_limit], "keywords": keywords[:keyword_limit]}
 
     def load_docs(self, docs_dir, bpe):
         self.docs = []
@@ -709,26 +780,89 @@ class Interference:
             except OSError:
                 continue
             ids = bpe_encode(bpe, raw, len(raw), len(raw))
-            tmp = MetaW()
-            meta_build(tmp, ids, len(ids), bpe.vocab_size)
-            heavy = []
-            counts = {}
-            for a, b, _p in tmp.bigrams:
-                counts[a] = counts.get(a, 0) + 1
-                counts[b] = counts.get(b, 0) + 1
-            ranked = sorted(counts.items(), key=lambda x: (-x[1], x[0]))
-            for tok, _score in ranked:
-                dec = bpe_decode_token(bpe, tok).strip()
-                if len(dec) > 2 and any(ch.isalpha() for ch in dec):
-                    heavy.append(tok)
-                if len(heavy) >= 32:
+            doc = {"name": fn, **self._summarize_ids(ids, bpe, 32, 16), "chunks": []}
+            chunk_len = 64
+            stride = 32
+            for start in range(0, len(ids), stride):
+                part = ids[start:start + chunk_len]
+                if len(part) < 12:
+                    continue
+                chunk = self._summarize_ids(part, bpe, 16, 8)
+                if chunk["heavy"]:
+                    chunk["start"] = start
+                    doc["chunks"].append(chunk)
+                if len(doc["chunks"]) >= 8:
                     break
-            self.docs.append({"name": fn, "heavy": heavy or ids[:32]})
+            if not doc["chunks"] and doc["heavy"]:
+                doc["chunks"].append({"start": 0, "heavy": doc["heavy"][:16], "keywords": doc["keywords"][:8]})
+            self.docs.append(doc)
 
-    def inject_seed(self, chambers=None, bpe=None, periodic=None):
+    def _score_item(self, item, words, dom, periodic, prophecy_words):
+        score = 0.01 * len(item.get("heavy", []))
+        for word in item.get("keywords", []):
+            if word in words:
+                score += 1.2
+            if word in ANCHORS and ANCHORS[word] == dom:
+                score += 0.6
+            if periodic is not None:
+                el = periodic.classify(word)
+                if el is not None and el["ch"] == dom:
+                    score += 0.35 * el["mass"]
+            if word in prophecy_words:
+                score += 0.9 * prophecy_words[word]
+        score += random.random() * 0.05
+        return score
+
+    def _prophecy_words(self, mw, bpe):
+        out = {}
+        if mw is None:
+            return out
+        for target, strength, _age in mw.prophecies:
+            word = bpe_decode_token(bpe, target).strip().lower()
+            if len(word) > 2 and any(ch.isalpha() for ch in word):
+                age_boost = strength * math.log1p(float(_age))
+                out[word] = max(out.get(word, 0.0), age_boost)
+        return out
+
+    def choose_doc(self, text=None, chambers=None, periodic=None, mw=None, bpe=None):
         if not self.docs:
             return None
-        doc = random.choice(self.docs)
+        if chambers is None and not text:
+            return random.choice(self.docs)
+        words = set(extract_words(text or ""))
+        dom = chambers.dominant() if chambers is not None else CH_FLOW
+        prophecy_words = self._prophecy_words(mw, bpe) if bpe is not None else {}
+        best_doc = None
+        best_score = -1e30
+        for doc in self.docs:
+            score = self._score_item(doc, words, dom, periodic, prophecy_words)
+            if score > best_score:
+                best_score = score
+                best_doc = doc
+        return best_doc
+
+    def choose_chunk(self, doc, text=None, chambers=None, periodic=None, mw=None, bpe=None):
+        if doc is None:
+            return None
+        chunks = doc.get("chunks") or []
+        if not chunks:
+            return doc
+        words = set(extract_words(text or ""))
+        dom = chambers.dominant() if chambers is not None else CH_FLOW
+        prophecy_words = self._prophecy_words(mw, bpe) if bpe is not None else {}
+        best_chunk = chunks[0]
+        best_score = -1e30
+        for chunk in chunks:
+            score = self._score_item(chunk, words, dom, periodic, prophecy_words)
+            if score > best_score:
+                best_score = score
+                best_chunk = chunk
+        return best_chunk
+
+    def inject_seed(self, chambers=None, bpe=None, periodic=None, doc=None):
+        if not self.docs and doc is None:
+            return None
+        doc = doc or random.choice(self.docs)
         if not doc["heavy"]:
             return None
         if chambers is None or bpe is None:
@@ -756,6 +890,18 @@ class Interference:
             if cum >= r:
                 return tid
         return top[0][1]
+def interference_signal(doc, V):
+    out = [0.0] * V
+    if doc is None:
+        return out
+    for rank, tid in enumerate(doc.get("heavy", [])[:16]):
+        if 0 <= tid < V:
+            out[tid] += 1.0 / (1.0 + rank)
+    mx = max(out) if out else 0.0
+    if mx > 1e-8:
+        for i in range(V):
+            out[i] /= mx
+    return out
 # ── DOE Parliament ──
 class Expert:
     def __init__(self):
@@ -1184,7 +1330,7 @@ def starts_with_space(bpe, tid):
         return False
     return b[0] == ord(' ')
 # ── generate sentence ──
-def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, somatic_vel=VEL_WALK):
+def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, velocity=None, doc_signal=None):
     tf_reset(t)
     V = t.V; D = t.D
     destiny = [0.0] * D
@@ -1205,7 +1351,6 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
     am, bm, gm, tm = (1.0, 1.0, 1.0, 1.0)
     if ch_ptr is not None:
         am, bm, gm, tm = ch_ptr.modulate()
-    am, bm, gm, tm, temp = apply_velocity(somatic_vel, am, bm, gm, tm, temp)
 
     for step in range(120):
         if gl >= maxo:
@@ -1256,6 +1401,7 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
         hs = max(0, cl - 8)
         heb = meta_hebb(mw, ctx[hs:cl], cl - hs, V)
         pro = meta_prophecy(mw, ctx[:cl], cl, V)
+        p_debt = prophecy_pressure(mw)
 
         # trauma gravity
         if ch_ptr is not None and ch_ptr.trauma > 0.1:
@@ -1272,6 +1418,13 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
         c_ds  = (0.3 if has_tf else 0.15) * gm
         c_bg  = 5.0 if has_tf else 15.0
         c_tg  = 3.0 if has_tf else 10.0
+        if velocity is not None:
+            c_heb *= velocity["heb_mul"]
+            c_pro *= velocity["pro_mul"] * (1.0 + 0.35 * p_debt)
+            c_ds *= velocity["ds_mul"]
+            c_bg *= velocity["bg_mul"]
+            c_tg *= velocity["tg_mul"]
+        c_doc = 0.18 if has_tf else 0.32
 
         for i in range(V):
             bg = meta_bi(mw, ctx[cl - 1], i)
@@ -1283,6 +1436,8 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
                     dot = sum(destiny[d] * t.tok[i * D + d] for d in range(D))
                     ds = dot / (dn * en)
             raw[i] += c_heb * heb[i] + c_pro * pro[i] + c_ds * ds + c_bg * bg + c_tg * tg_val
+            if doc_signal is not None:
+                raw[i] += c_doc * doc_signal[i]
             if mw.unigram[i] < 1e-6:
                 raw[i] -= 2.0
             elif mw.unigram[i] > 0.01:
@@ -1320,11 +1475,13 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
                     mx_val = raw[i]
                     ch_tok = i
         else:
-            ch_tok = sample_nucleus(raw, V, clampf(temp * tm, 0.3, 1.2), 0.85)
+            vel_temp = velocity["temp_mul"] if velocity is not None else 1.0
+            ch_tok = sample_nucleus(raw, V, clampf(temp * tm * vel_temp, 0.25, 1.35), 0.85)
 
         prev_chosen = ch_tok
         out.append(ch_tok); gl += 1
         ctx[cl] = ch_tok; cl += 1
+        prophecy_update(mw, ch_tok)
 
         # word capture
         if cl >= 2:
@@ -1339,6 +1496,19 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr,
             if not found and mw.n_bi < MAX_BIGRAM:
                 mw.bigrams.append([prev_tok, cur, 0.01])
                 mw.n_bi += 1
+            best_pred = -1
+            best_prob = 0.0
+            for i in range(mw.n_tri):
+                if mw.trigrams[i][0] == prev_tok and mw.trigrams[i][1] == cur and mw.trigrams[i][3] > best_prob:
+                    best_prob = mw.trigrams[i][3]
+                    best_pred = mw.trigrams[i][2]
+            if best_pred < 0:
+                for i in range(mw.n_bi):
+                    if mw.bigrams[i][0] == cur and mw.bigrams[i][2] > best_prob:
+                        best_prob = mw.bigrams[i][2]
+                        best_pred = mw.bigrams[i][1]
+            if best_pred >= 0:
+                prophecy_add(mw, best_pred, 0.2 + 0.5 * best_prob)
 
             hw = max(0, cl - 6)
             for ri in range(hw, cl - 1):
@@ -1437,21 +1607,18 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     if nb >= CHAIN_STEPS:
         nb = CHAIN_STEPS - 1
 
-    # somatic dissonance + velocity (micro-Klaus sonar)
-    somatic_diss = 0.5
-    somatic_vel = VEL_WALK
     if input_text:
         inp_bytes = input_text.encode("utf-8", errors="replace")
-        uids = bpe_encode(bpe, inp_bytes, len(inp_bytes), 512)
-        ingest_ids(mw, uids)
+        ingest_ids(mw, bpe_encode(bpe, inp_bytes, len(inp_bytes), 512))
         ch.feel(input_text, periodic)
-        somatic_diss = compute_dissonance(mw, uids, t.V)
-        somatic_vel = auto_velocity(somatic_diss)
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
         ch_xfire(ch, 8)
+    vel = velocity_profile(ch, cd)
+    ch.debt = clampf((0.88 * ch.debt + 0.12 * prophecy_pressure(mw)) * vel["debt_decay"], 0.0, 1.0)
+    ch.trauma = clampf(ch.trauma * vel["trauma_decay"], 0.0, 1.0)
 
     mode_str = "[TRAINED]" if has_weights else "[METAWEIGHTS ONLY]"
-    print("\n  diss=%.3f debt=%.3f emrg=%.3f somatic_d=%.3f vel=%s %s" % (cd, ch.debt, ch.emergence(), somatic_diss, VEL_NAMES[somatic_vel], mode_str))
+    print("\n  diss=%.3f debt=%.3f emrg=%.3f vel=%s %s" % (cd, ch.debt, ch.emergence(), vel["name"], mode_str))
     print("  chambers: %s" % ch.summary())
     if parl is not None:
         av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
@@ -1474,10 +1641,19 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         else:
             direction = 1
 
+        active_doc = interference.choose_doc(input_text, ch, periodic, mw, bpe) if interference is not None and interference.docs else None
+        active_chunk = interference.choose_chunk(active_doc, input_text, ch, periodic, mw, bpe) if active_doc is not None else None
+        if active_chunk is not None and t.D > 0 and active_chunk.get("heavy"):
+            seed_tok = active_chunk["heavy"][0]
+            if 0 <= seed_tok < t.V:
+                for d in range(t.D):
+                    gdest[d] = 0.97 * gdest[d] + 0.03 * t.tok[seed_tok * t.D + d]
+        doc_signal = interference_signal(active_chunk, t.V) if active_chunk is not None else None
+
         prompt = None
         used_interference = False
-        if interference is not None and interference.docs and random.random() < 0.3:
-            seed = interference.inject_seed(ch, bpe, periodic)
+        if interference is not None and interference.docs and random.random() < clampf(0.3 + vel["interf_bonus"], 0.05, 0.5):
+            seed = interference.inject_seed(ch, bpe, periodic, active_chunk or active_doc)
             if seed is not None:
                 prompt = [seed]
                 used_interference = True
@@ -1527,7 +1703,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                     + 0.1 * math.sin(2 * math.pi * 20.8 * t_sec)
                     + 0.05 * math.sin(2 * math.pi * 27.3 * t_sec))
         base_temp = 0.6 if has_weights else 0.75
-        temp = clampf(base_temp + 0.08 * schumann, 0.4, 0.85)
+        temp = clampf((base_temp + 0.08 * schumann) * vel["temp_mul"], 0.35, 0.95)
 
         # best-of-3
         best_out = []
@@ -1538,7 +1714,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         for cand in range(3):
             if cand > 0 and gdest_save is not None:
                 gdest[:] = list(gdest_save)
-            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, somatic_vel)
+            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, vel, doc_signal)
             sc = coherence_score(mw, result, len(result), t.V)
             if sc > best_sc:
                 best_sc = sc
@@ -1552,13 +1728,14 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             wh_prob = 0.02
             if cd > 0.3:
                 wh_prob += ((cd - 0.3) / 0.7) * 0.15
+            wh_prob = clampf(wh_prob + vel["wormhole_bonus"], 0.0, 0.3)
             wormhole = random.random() < wh_prob
             if wormhole and interference is not None and interference.docs:
                 longest = max(interference.docs, key=lambda d: len(d["heavy"]))
                 if longest["heavy"]:
                     prompt = [random.choice(longest["heavy"])]
                     direction = -direction if direction != 0 else 1
-                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, somatic_vel)
+                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, vel, doc_signal)
                     best_ol = len(best_out)
                     best_sc = coherence_score(mw, best_out, best_ol, t.V)
 
@@ -1617,7 +1794,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             nprom = min(3, chain_lens[seed_src])
             prompt = chain_ids[seed_src][chain_lens[seed_src] - nprom:chain_lens[seed_src]]
             reseed_temp = 0.55 if has_weights else 0.7
-            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, somatic_vel)
+            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, vel, doc_signal)
             new_sc = coherence_score(mw, result, len(result), t.V)
             old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V)
             if new_sc > old_sc * 0.7 or len(result) > chain_lens[weak_idx]:  # accept if reasonable
