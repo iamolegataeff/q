@@ -745,6 +745,105 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
         return True
     except Exception:
         return False
+def consolidate_experience(mw, periodic=None, chambers=None, events=None):
+    if events is None:
+        return
+    periodic = periodic or PeriodicTable()
+    chambers = chambers or Chambers()
+    scars = events.get("scars", [])
+    worms = events.get("wormholes", [])
+    props = events.get("prophecies", [])
+    phases = events.get("phases", [])
+    chunks = events.get("chunks", [])
+    scar_avg = sum(ev["scar"] for ev in scars) / len(scars) if scars else 0.0
+    worm_success = sum(1.0 if ev.get("success") else 0.0 for ev in worms) / len(worms) if worms else 0.0
+    worm_coh = sum(ev.get("coherence", 0.0) for ev in worms) / len(worms) if worms else 0.0
+    prop_avg = sum(ev.get("pressure", 0.0) for ev in props) / len(props) if props else 0.0
+    chunk_avg = sum(ev.get("resonance", 0.0) for ev in chunks) / len(chunks) if chunks else 0.0
+    if phases:
+        inv = 1.0 / len(phases)
+        chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], inv * sum(ev.get("flow", 0) for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], inv * sum(ev.get("fear", 0) for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], inv * sum(ev.get("void", 0) for ev in phases)), 0.0, 1.0)
+        chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], inv * sum(ev.get("complexity", 0) for ev in phases)), 0.0, 1.0)
+    if worms:
+        chambers.presence = clampf(max(chambers.presence, 0.18 * worm_success + 0.12 * worm_coh), 0.0, 1.0)
+    if props:
+        chambers.debt = clampf(max(chambers.debt, 0.25 * prop_avg), 0.0, 1.0)
+    if scars:
+        chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), 0.40 * scar_avg), 0.0, 1.0)
+    prop_boost = clampf(0.05 + 0.18 * prop_avg + 0.02 * chunk_avg + 0.08 * worm_success - 0.04 * scar_avg, 0.0, 0.28)
+    for item in mw.prophecies[:min(8, len(mw.prophecies))]:
+        item[1] = clampf(item[1] + prop_boost, 0.0, 1.0)
+        item[2] = max(item[2], 1)
+QSPORE_MAGIC = 0x51535052
+QSPORE_VERSION = 1
+def save_spore(mw, path, periodic=None, chambers=None):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "wb") as mf:
+        mf.write(struct.pack("<II", QSPORE_MAGIC, QSPORE_VERSION))
+        if chambers is None:
+            mf.write(struct.pack("<6f", *([0.0] * 6)))
+            mf.write(struct.pack("<6f", *([0.0] * 6)))
+            mf.write(struct.pack("<4f", 0.0, 0.0, 0.0, 0.0))
+        else:
+            mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.act]))
+            mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
+            mf.write(struct.pack("<4f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)))
+        prophecies = list(mw.prophecies[:16])
+        mf.write(struct.pack("<I", len(prophecies)))
+        for target, strength, age in prophecies:
+            mf.write(struct.pack("<ifi", target, clampf(strength, 0.0, 1.0), int(age)))
+        elems = []
+        if periodic is not None:
+            elems = sorted(periodic.elements.items(), key=lambda item: (-item[1]["mass"], item[0]))[:32]
+        mf.write(struct.pack("<I", len(elems)))
+        for word, elem in elems:
+            wbytes = word.encode("utf-8")[:31]
+            mf.write(struct.pack("B", len(wbytes)))
+            mf.write(wbytes)
+            mf.write(struct.pack("B", elem["ch"]))
+            mf.write(struct.pack("<f", clampf(elem["mass"], 0.0, 1.0)))
+def load_spore(mw, path, periodic=None, chambers=None):
+    try:
+        with open(path, "rb") as mf:
+            magic, version = struct.unpack("<II", mf.read(8))
+            if magic != QSPORE_MAGIC or version != QSPORE_VERSION:
+                return False
+            act_vals = struct.unpack("<6f", mf.read(24))
+            soma_vals = struct.unpack("<6f", mf.read(24))
+            presence, debt, trauma, scar = struct.unpack("<4f", mf.read(16))
+            if chambers is not None:
+                for i in range(N_CHAMBERS):
+                    chambers.act[i] = clampf(max(chambers.act[i], 0.55 * act_vals[i]), 0.0, 1.0)
+                    chambers.soma[i] = clampf(max(chambers.soma[i], 0.60 * soma_vals[i]), 0.0, 1.0)
+                chambers.presence = clampf(max(chambers.presence, 0.70 * presence), 0.0, 1.0)
+                chambers.debt = clampf(max(chambers.debt, 0.55 * debt), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, 0.55 * trauma), 0.0, 1.0)
+                chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), 0.60 * scar), 0.0, 1.0)
+            n_prop = struct.unpack("<I", mf.read(4))[0]
+            for _ in range(min(n_prop, 16)):
+                target, strength, age = struct.unpack("<ifi", mf.read(12))
+                prophecy_add(mw, target, 0.65 * strength)
+                if mw.prophecies:
+                    mw.prophecies[-1][2] = max(mw.prophecies[-1][2], int(age))
+            n_elem = struct.unpack("<I", mf.read(4))[0]
+            if periodic is not None:
+                for _ in range(min(n_elem, 32)):
+                    wlen = struct.unpack("B", mf.read(1))[0]
+                    word = mf.read(wlen).decode("utf-8", errors="replace")
+                    chamber = struct.unpack("B", mf.read(1))[0]
+                    mass = struct.unpack("<f", mf.read(4))[0]
+                    if chamber < 6 and word:
+                        prev = periodic.elements.get(word)
+                        val = {"ch": chamber, "mass": 0.65 * clampf(mass, 0.0, 1.0)}
+                        if prev is None or val["mass"] > prev["mass"]:
+                            periodic.elements[word] = val
+            return True
+    except Exception:
+        return False
 # ── Chambers ──
 class Chambers:
     def __init__(self):
@@ -1107,25 +1206,31 @@ class Expert:
     def __init__(self):
         self.A = []
         self.B = []
+        self.trace = []
         self.d_in = 0
         self.d_out = 0
         self.rank = 0
         self.vitality = 1.0
         self.overload = 0.0
         self.resonance = 0.0
+        self.plasticity_mass = 0.0
         self.age = 0
         self.low_steps = 0
+        self.consolidations = 0
 def expert_init(e, d_in, d_out, rank):
     e.d_in = d_in
     e.d_out = d_out
     e.rank = rank
     e.A = [0.01 * (random.random() - 0.5) for _ in range(rank * d_in)]
     e.B = [0.01 * (random.random() - 0.5) for _ in range(d_out * rank)]
+    e.trace = [0.0] * (rank * d_in)
     e.vitality = 1.0
     e.overload = 0.0
     e.resonance = 0.0
+    e.plasticity_mass = 0.0
     e.age = 0
     e.low_steps = 0
+    e.consolidations = 0
 def expert_forward(e, x):
     mid = [0.0] * e.rank
     for r in range(e.rank):
@@ -1150,9 +1255,28 @@ def expert_hebbian(e, x, dy, lr):
         u += 0.01 * (random.random() - 0.5)
         base_a = r * e.d_in
         for d in range(e.d_in):
-            e.A[base_a + d] += lr * x[d] * u
+            delta = lr * x[d] * u
+            e.A[base_a + d] += delta
+            e.trace[base_a + d] = 0.96 * e.trace[base_a + d] + 0.04 * delta
+            e.plasticity_mass += abs(delta)
         for o in range(e.d_out):
             e.B[o * e.rank + r] *= 0.999
+def expert_consolidate(e):
+    if e.plasticity_mass < 0.002:
+        return False
+    norm = sum(abs(v) for v in e.trace) / max(1, len(e.trace))
+    if norm < 1e-8:
+        return False
+    gain = min(0.12, 0.02 + 0.35 * e.plasticity_mass)
+    for i in range(len(e.trace)):
+        e.A[i] += gain * e.trace[i] / norm
+        e.trace[i] *= 0.45
+    e.vitality = clampf(e.vitality + 0.04, 0.0, 1.0)
+    e.overload *= 0.88
+    e.resonance = clampf(e.resonance + 0.03, -1.0, 1.0)
+    e.plasticity_mass *= 0.35
+    e.consolidations += 1
+    return True
 class Parliament:
     def __init__(self):
         self.ex = []
@@ -1162,12 +1286,22 @@ class Parliament:
         self.step = 0
         self.last_k = 0
         self.last_entropy = 0.0
+        self.last_diversity = 0.0
+        self.n_winners = 0
+        self.last_consolidations = 0
+        self.last_births = 0
+        self.last_deaths = 0
 def parl_init(p, d_model, n_init):
     p.d_model = d_model
     p.alpha = DOE_ALPHA
     p.step = 0
     p.last_k = 0
     p.last_entropy = 0.0
+    p.last_diversity = 0.0
+    p.n_winners = 0
+    p.last_consolidations = 0
+    p.last_births = 0
+    p.last_deaths = 0
     p.n = min(n_init, MAX_EXPERTS)
     p.ex = []
     for _ in range(p.n):
@@ -1236,8 +1370,11 @@ def parl_notorch(p, x, debt, dlen):
     ds = [0.0] * p.d_model
     for i in range(n):
         ds[i] = debt[i]
+    p.last_consolidations = 0
     for i in range(p.n):
         expert_hebbian(p.ex[i], x, ds, 0.001)
+        if p.ex[i].plasticity_mass > 0.003 and expert_consolidate(p.ex[i]):
+            p.last_consolidations += 1
         p.ex[i].age += 1
 def parl_lifecycle(p):
     # apoptosis

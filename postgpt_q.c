@@ -18,6 +18,7 @@
 #include <string.h>
 #include <math.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <stdint.h>
 #include <ctype.h>
 
@@ -360,12 +361,14 @@ typedef struct{int step; int success; float coherence,debt;}WormholeEvent;
 typedef struct{int step; float pressure,debt;}ProphecyEvent;
 typedef struct{int step; char phase[12]; float flow,fear,voidv,complexity;}PhaseEvent;
 typedef struct{int step; char doc_name[64]; int chunk_start; float resonance;}ChunkEvent;
+typedef struct{int step,experts,winners,births,deaths,consolidations; float diversity,avg_vitality;}ParliamentEvent;
 typedef struct{
     ScarEvent scars[128]; int n_scars;
     WormholeEvent wormholes[256]; int n_wormholes;
     ProphecyEvent prophecies[512]; int n_prophecies;
     PhaseEvent phases[256]; int n_phases;
     ChunkEvent chunks[256]; int n_chunks;
+    ParliamentEvent parliament[256]; int n_parliament;
 }ExperienceLog;
 static ExperienceLog QEXP={0};
 
@@ -416,6 +419,33 @@ static void qexp_add_chunk(int step, const char *doc_name, int chunk_start, floa
     ChunkEvent *e=&QEXP.chunks[QEXP.n_chunks++];
     memset(e,0,sizeof(*e)); e->step=step; e->chunk_start=chunk_start; e->resonance=resonance;
     if(doc_name) snprintf(e->doc_name,sizeof(e->doc_name),"%s",doc_name);
+}
+static void qexp_add_parliament(int step, int experts, int winners, float diversity, float avg_vitality, int births, int deaths, int consolidations){
+    if(QEXP.n_parliament>=256) return;
+    QEXP.parliament[QEXP.n_parliament++] = (ParliamentEvent){step,experts,winners,births,deaths,consolidations,diversity,avg_vitality};
+}
+static void consolidate_experience(MetaW *mw, PeriodicTable *pt, Chambers *ch){
+    float scar_avg=0, worm_success=0, worm_coh=0, prop_avg=0, chunk_avg=0;
+    if(QEXP.n_scars>0){ for(int i=0;i<QEXP.n_scars;i++) scar_avg+=QEXP.scars[i].scar; scar_avg/=QEXP.n_scars; }
+    if(QEXP.n_wormholes>0){
+        for(int i=0;i<QEXP.n_wormholes;i++){ worm_success += QEXP.wormholes[i].success?1.0f:0.0f; worm_coh += QEXP.wormholes[i].coherence; }
+        worm_success/=QEXP.n_wormholes; worm_coh/=QEXP.n_wormholes;
+    }
+    if(QEXP.n_prophecies>0){ for(int i=0;i<QEXP.n_prophecies;i++) prop_avg+=QEXP.prophecies[i].pressure; prop_avg/=QEXP.n_prophecies; }
+    if(QEXP.n_chunks>0){ for(int i=0;i<QEXP.n_chunks;i++) chunk_avg+=QEXP.chunks[i].resonance; chunk_avg/=QEXP.n_chunks; }
+    if(QEXP.n_phases>0){
+        float inv=1.0f/QEXP.n_phases, flow=0,fear=0,voidv=0,cmplx=0;
+        for(int i=0;i<QEXP.n_phases;i++){ flow+=QEXP.phases[i].flow; fear+=QEXP.phases[i].fear; voidv+=QEXP.phases[i].voidv; cmplx+=QEXP.phases[i].complexity; }
+        ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]>(flow*inv)?ch->act[CH_FLOW]:(flow*inv),0,1);
+        ch->act[CH_FEAR]=clampf(ch->act[CH_FEAR]>(fear*inv)?ch->act[CH_FEAR]:(fear*inv),0,1);
+        ch->act[CH_VOID]=clampf(ch->act[CH_VOID]>(voidv*inv)?ch->act[CH_VOID]:(voidv*inv),0,1);
+        ch->act[CH_CMPLX]=clampf(ch->act[CH_CMPLX]>(cmplx*inv)?ch->act[CH_CMPLX]:(cmplx*inv),0,1);
+    }
+    if(QEXP.n_wormholes>0) ch->presence=clampf(ch->presence>(0.18f*worm_success+0.12f*worm_coh)?ch->presence:(0.18f*worm_success+0.12f*worm_coh),0,1);
+    if(QEXP.n_prophecies>0) ch->debt=clampf(ch->debt>(0.25f*prop_avg)?ch->debt:(0.25f*prop_avg),0,1);
+    if(QEXP.n_scars>0) ch->scar=clampf(ch->scar>(0.40f*scar_avg)?ch->scar:(0.40f*scar_avg),0,1);
+    {float prop_boost=clampf(0.05f+0.18f*prop_avg+0.02f*chunk_avg+0.08f*worm_success-0.04f*scar_avg,0,0.28f);
+    for(int i=0;i<mw->n_prophecy&&i<8;i++){ mw->prophecies[i].strength=clampf(mw->prophecies[i].strength+prop_boost,0,1); if(mw->prophecies[i].age<1) mw->prophecies[i].age=1; }}
 }
 static int periodic_find(const PeriodicTable *pt, const char *word){
     for(int i=0;i<pt->n;i++) if(strcmp(pt->elements[i].word,word)==0) return i;
@@ -747,25 +777,29 @@ static void interf_signal_chunk(const InterferenceChunk *chunk, float *out, int 
 typedef struct{
     float *A;  /* [rank × d_in] */
     float *B;  /* [d_out × rank] */
+    float *trace; /* [rank × d_in] — plasticity trace */
     int d_in,d_out,rank;
     float vitality;
-    float overload,resonance;
+    float overload,resonance,plasticity_mass;
     int age,low_steps;
+    int consolidations;
 }Expert;
 
 typedef struct{
     Expert ex[MAX_EXPERTS]; int n;
     int d_model; float alpha;
-    int step,last_k; float last_entropy;
+    int step,last_k; float last_entropy,last_diversity;
+    int last_winners[MAX_EXPERTS],n_winners,last_consolidations,last_births,last_deaths;
 }Parliament;
 
 static void expert_init(Expert *e, int d_in, int d_out, int rank){
     e->d_in=d_in;e->d_out=d_out;e->rank=rank;
     e->A=calloc(rank*d_in,sizeof(float));
     e->B=calloc(d_out*rank,sizeof(float));
+    e->trace=calloc(rank*d_in,sizeof(float));
     for(int i=0;i<rank*d_in;i++) e->A[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
     for(int i=0;i<d_out*rank;i++) e->B[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
-    e->vitality=1.0f;e->overload=0;e->resonance=0;e->age=0;e->low_steps=0;
+    e->vitality=1.0f;e->overload=0;e->resonance=0;e->plasticity_mass=0;e->age=0;e->low_steps=0;e->consolidations=0;
 }
 
 static void expert_forward(const Expert *e, const float *x, float *out){
@@ -778,13 +812,34 @@ static void expert_hebbian(Expert *e, const float *x, const float *dy, float lr)
     for(int r=0;r<e->rank;r++){
         float u=0;for(int o=0;o<e->d_out;o++) u+=e->B[o*e->rank+r]*dy[o];
         u+=0.01f*((float)rand()/RAND_MAX-0.5f);
-        for(int d=0;d<e->d_in;d++) e->A[r*e->d_in+d]+=lr*x[d]*u;
+        for(int d=0;d<e->d_in;d++){
+            float delta=lr*x[d]*u;
+            int idx=r*e->d_in+d;
+            e->A[idx]+=delta;
+            e->trace[idx]=0.96f*e->trace[idx]+0.04f*delta;
+            e->plasticity_mass+=fabsf(delta);
+        }
         for(int o=0;o<e->d_out;o++) e->B[o*e->rank+r]*=0.999f;
     }
 }
+static int expert_consolidate(Expert *e){
+    if(e->plasticity_mass<0.002f) return 0;
+    float norm=0; int n=e->rank*e->d_in;
+    for(int i=0;i<n;i++) norm+=fabsf(e->trace[i]);
+    norm/=n>0?n:1;
+    if(norm<1e-8f) return 0;
+    {float gain=clampf(0.02f+0.35f*e->plasticity_mass,0,0.12f);
+    for(int i=0;i<n;i++){ e->A[i]+=gain*e->trace[i]/norm; e->trace[i]*=0.45f; }}
+    e->vitality=clampf(e->vitality+0.04f,0,1);
+    e->overload*=0.88f;
+    e->resonance=clampf(e->resonance+0.03f,-1,1);
+    e->plasticity_mass*=0.35f;
+    e->consolidations++;
+    return 1;
+}
 
 static void parl_init(Parliament *p, int d_model, int n_init){
-    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;
+    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;p->last_consolidations=0;p->last_births=0;p->last_deaths=0;
     p->n=n_init<MAX_EXPERTS?n_init:MAX_EXPERTS;
     for(int i=0;i<p->n;i++) expert_init(&p->ex[i],d_model,d_model,DOE_RANK);
 }
@@ -837,7 +892,7 @@ static void parl_notorch(Parliament *p, const float *x, const float *debt, int d
     int n=dlen<p->d_model?dlen:p->d_model;
     float *ds=calloc(p->d_model,sizeof(float));
     for(int i=0;i<n;i++) ds[i]=debt[i];
-    for(int i=0;i<p->n;i++){expert_hebbian(&p->ex[i],x,ds,0.001f);p->ex[i].age++;}
+    for(int i=0;i<p->n;i++){expert_hebbian(&p->ex[i],x,ds,0.001f); if(p->ex[i].plasticity_mass>0.003f&&expert_consolidate(&p->ex[i])) p->last_consolidations++; p->ex[i].age++;}
     free(ds);
 }
 
@@ -846,7 +901,7 @@ static void parl_lifecycle(Parliament *p){
     int alive=0;
     for(int i=0;i<p->n;i++){
         if(p->ex[i].low_steps>=10&&p->ex[i].vitality<0.08f&&p->ex[i].age>24&&p->n>2){
-            free(p->ex[i].A);free(p->ex[i].B);continue;}
+            free(p->ex[i].A);free(p->ex[i].B);free(p->ex[i].trace);continue;}
         if(alive!=i) p->ex[alive]=p->ex[i];alive++;
     }
     p->n=alive;
@@ -1422,6 +1477,46 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     free(gdest);
 }
 
+/* ── Spore format — compact binary state snapshot ── */
+#define QSPORE_MAGIC 0x51535052u
+#define QSPORE_VERSION 1u
+static int qspore_save(const MetaW *mw, const char *path, const PeriodicTable *pt, const Chambers *ch){
+    const char *slash = strrchr(path,'/');
+    if(slash){ char dir[256]; size_t n=(size_t)(slash-path); if(n>=sizeof(dir)) n=sizeof(dir)-1; memcpy(dir,path,n); dir[n]='\0'; mkdir(dir,0755); }
+    FILE *f=fopen(path,"wb"); if(!f) return 0;
+    uint32_t magic=QSPORE_MAGIC, ver=QSPORE_VERSION;
+    fwrite(&magic,4,1,f); fwrite(&ver,4,1,f);
+    fwrite(ch->act,sizeof(float),6,f);
+    fwrite(ch->soma,sizeof(float),6,f);
+    fwrite(&ch->presence,4,1,f); fwrite(&ch->debt,4,1,f); fwrite(&ch->trauma,4,1,f); fwrite(&ch->scar,4,1,f);
+    uint32_t np=(uint32_t)(mw->n_prophecy<16?mw->n_prophecy:16); fwrite(&np,4,1,f);
+    for(uint32_t i=0;i<np;i++){ fwrite(&mw->prophecies[i].target,4,1,f); fwrite(&mw->prophecies[i].strength,4,1,f); fwrite(&mw->prophecies[i].age,4,1,f); }
+    uint32_t ne=(uint32_t)(pt->n<32?pt->n:32); fwrite(&ne,4,1,f);
+    for(uint32_t i=0;i<ne;i++){
+        uint8_t wlen=(uint8_t)strlen(pt->elements[i].word);
+        fwrite(&wlen,1,1,f); fwrite(pt->elements[i].word,1,wlen,f);
+        uint8_t chamber=(uint8_t)pt->elements[i].chamber; fwrite(&chamber,1,1,f); fwrite(&pt->elements[i].mass,4,1,f);
+    }
+    fclose(f); return 1;
+}
+static int qspore_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers *ch){
+    FILE *f=fopen(path,"rb"); if(!f) return 0;
+    uint32_t magic=0, ver=0; if(fread(&magic,4,1,f)!=1||fread(&ver,4,1,f)!=1||magic!=QSPORE_MAGIC||ver!=QSPORE_VERSION){ fclose(f); return 0; }
+    float act[6]={0}, soma[6]={0}, presence=0,debt=0,trauma=0,scar=0;
+    if(fread(act,sizeof(float),6,f)!=6||fread(soma,sizeof(float),6,f)!=6){ fclose(f); return 0; }
+    fread(&presence,4,1,f); fread(&debt,4,1,f); fread(&trauma,4,1,f); fread(&scar,4,1,f);
+    for(int i=0;i<6;i++){ ch->act[i]=clampf(ch->act[i]>(0.55f*act[i])?ch->act[i]:(0.55f*act[i]),0,1); ch->soma[i]=clampf(ch->soma[i]>(0.60f*soma[i])?ch->soma[i]:(0.60f*soma[i]),0,1); }
+    ch->presence=clampf(ch->presence>(0.70f*presence)?ch->presence:(0.70f*presence),0,1);
+    ch->debt=clampf(ch->debt>(0.55f*debt)?ch->debt:(0.55f*debt),0,1);
+    ch->trauma=clampf(ch->trauma>(0.55f*trauma)?ch->trauma:(0.55f*trauma),0,1);
+    ch->scar=clampf(ch->scar>(0.60f*scar)?ch->scar:(0.60f*scar),0,1);
+    uint32_t np=0; fread(&np,4,1,f);
+    for(uint32_t i=0;i<np&&i<16;i++){ int target=0,age=0; float strength=0; fread(&target,4,1,f); fread(&strength,4,1,f); fread(&age,4,1,f); prophecy_add(mw,target,0.65f*strength); if(mw->n_prophecy>0) mw->prophecies[mw->n_prophecy-1].age = mw->prophecies[mw->n_prophecy-1].age>age?mw->prophecies[mw->n_prophecy-1].age:age; }
+    uint32_t ne=0; fread(&ne,4,1,f);
+    for(uint32_t i=0;i<ne&&i<32;i++){ uint8_t wlen=0,chamber=0; char w[32]={0}; float mass=0; fread(&wlen,1,1,f); if(wlen>31)wlen=31; fread(w,1,wlen,f); fread(&chamber,1,1,f); fread(&mass,4,1,f); if(chamber<6) periodic_add(pt,w,(int)chamber,0.65f*clampf(mass,0,1)); }
+    fclose(f); return 1;
+}
+
 /* ── main ── */
 int main(int argc, char **argv){
     printf("PostGPT-Q — Resonant Reasoning Engine (C)\ntheta = epsilon + gamma + alpha*delta\nresonance is unbreakable.\n\n");
@@ -1528,6 +1623,7 @@ int main(int argc, char **argv){
         }
         fclose(mf);
     }}
+    if(qspore_load(mw,"spores/q.spore.bin",&pt,&ch)) printf("  [spore loaded: spores/q.spore.bin]\n");
 
     printf("[5] DOE Parliament...\n");
     Parliament parl; parl_init(&parl,t.D,4);
@@ -1548,6 +1644,7 @@ int main(int argc, char **argv){
         gen_chain(&t,&bpe,mw,&ch,cids,clen,has_weights,&parl,&pt,&itf,input);
     }
     /* save evolved MetaWeights — Q remembers between sessions */
+    consolidate_experience(mw,&pt,&ch);
     {FILE *mf=fopen("q.memory","wb");
     if(mf){
         uint32_t magic=0x514D454D; /* QMEM */
@@ -1570,7 +1667,7 @@ int main(int argc, char **argv){
         fwrite(&ch.presence,4,1,mf);
         fwrite(&ch.debt,4,1,mf);
         fwrite(&ch.trauma,4,1,mf);}
-        fclose(mf);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
+        fclose(mf);qspore_save(mw,"spores/q.spore.bin",&pt,&ch);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.memory + q.spore.bin]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
     }}
     printf("\nresonance is unbreakable.\n");
     free(cids);free(mw);return 0;
