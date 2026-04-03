@@ -756,6 +756,7 @@ static int interf_seed(const Interference *itf, const Chambers *c, const BPE *bp
     if(doc->n_heavy<=0) return -1;
     int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
     for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,doc->heavy[i])) continue;
         char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
         for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
         for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
@@ -768,6 +769,7 @@ static int interf_seed_from_doc(const InterferenceDoc *doc, const Chambers *c, c
     if(!doc||doc->n_heavy<=0) return -1;
     int dom=ch_dominant(c),best=doc->heavy[rand()%doc->n_heavy]; float best_score=-1e30f;
     for(int i=0;i<doc->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,doc->heavy[i])) continue;
         char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,doc->heavy[i],buf,sizeof(buf));
         for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
         for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
@@ -780,6 +782,7 @@ static int interf_seed_from_chunk(const InterferenceChunk *chunk, const Chambers
     if(!chunk||chunk->n_heavy<=0) return -1;
     int dom=ch_dominant(c),best=chunk->heavy[rand()%chunk->n_heavy]; float best_score=-1e30f;
     for(int i=0;i<chunk->n_heavy&&i<MAX_HEAVY;i++){
+        if(!is_clean_seed_token(bpe,chunk->heavy[i])) continue;
         char buf[64]; float sc=((float)rand()/RAND_MAX)*0.05f; bpe_decode_token(bpe,chunk->heavy[i],buf,sizeof(buf));
         for(int j=0;buf[j];j++) buf[j]=(char)tolower((unsigned char)buf[j]);
         for(size_t j=0;j<sizeof(ANCHORS)/sizeof(ANCHORS[0]);j++) if(strcmp(buf,ANCHORS[j].word)==0&&ANCHORS[j].chamber==dom) sc+=1.0f;
@@ -909,18 +912,53 @@ static void parl_election(Parliament *p, const float *x, float *result){
     entropy/=logf((float)(p->n>1?p->n:2));
     int k=1+(int)((p->n-1)*clampf(entropy,0,1)); if(k<1)k=1; if(k>p->n)k=p->n;
     p->last_k=k; p->last_entropy=entropy;
-    /* softmax over top-k */
-    float exps[MAX_EXPERTS],tot=0;
-    for(int i=0;i<k;i++){exps[i]=expf(votes[sel[i]]-sv);tot+=exps[i];}
-    for(int i=0;i<k;i++){
-        float w=exps[i]/tot;
-        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[sel[i]][d];
-        p->ex[sel[i]].vitality=0.88f*p->ex[sel[i]].vitality+0.12f*fabsf(w);
-        p->ex[sel[i]].resonance=0.9f*p->ex[sel[i]].resonance+0.1f*votes[sel[i]];
-        p->ex[sel[i]].overload=clampf(0.92f*p->ex[sel[i]].overload+0.18f*((w-0.34f)>0?(w-0.34f):0),0,1);
-        p->ex[sel[i]].low_steps=0;
+    /* softmax over top-k — novelty-aware winner selection */
+    int winners[MAX_EXPERTS], n_winners=0;
+    unsigned char picked[MAX_EXPERTS]={0};
+    float diversity_sum=0;
+    for(int slot=0;slot<k;slot++){
+        int best_idx=-1; float best_score=-1e30f, best_novelty=0;
+        for(int si=0;si<p->n;si++){
+            int idx=sel[si]; if(picked[idx]) continue;
+            float novelty=1.0f;
+            if(n_winners>0){
+                float sim_sum=0;
+                float base_norm=1e-8f; for(int d=0;d<p->d_model;d++) base_norm+=outs[idx][d]*outs[idx][d];
+                base_norm=sqrtf(base_norm);
+                for(int wi=0;wi<n_winners;wi++){
+                    int prev=winners[wi];
+                    float other_norm=1e-8f,dot=0; for(int d=0;d<p->d_model;d++){ dot+=outs[idx][d]*outs[prev][d]; other_norm+=outs[prev][d]*outs[prev][d]; }
+                    other_norm=sqrtf(other_norm);
+                    {float sim=dot/(base_norm*other_norm); if(sim<0) sim=0; sim_sum+=sim;}
+                }
+                novelty=clampf(1.0f-sim_sum/n_winners,0,1);
+            }
+            {float score=votes[idx]+0.08f*novelty-0.06f*p->ex[idx].overload-0.03f*clampf(p->ex[idx].resonance,0,1);
+            if(score>best_score){best_score=score;best_idx=idx;best_novelty=novelty;}}
+        }
+        if(best_idx<0) break;
+        winners[n_winners++]=best_idx; picked[best_idx]=1; diversity_sum+=best_novelty;
     }
-    for(int i=k;i<p->n;i++){p->ex[sel[i]].vitality=clampf(0.97f*p->ex[sel[i]].vitality+0.01f*p->ex[sel[i]].resonance,0,1);p->ex[sel[i]].overload*=0.94f;p->ex[sel[i]].low_steps++;}
+    p->n_winners=n_winners; p->last_diversity=n_winners>0?diversity_sum/n_winners:0;
+    for(int i=0;i<n_winners;i++) p->last_winners[i]=winners[i];
+    /* softmax over winners */
+    float exps[MAX_EXPERTS],tot=0;
+    for(int i=0;i<n_winners;i++){exps[i]=expf(votes[winners[i]]-sv);tot+=exps[i];}
+    for(int i=0;i<n_winners;i++){
+        int idx=winners[i];
+        float w=exps[i]/tot;
+        for(int d=0;d<p->d_model;d++) result[d]+=w*outs[idx][d];
+        p->ex[idx].vitality=0.86f*p->ex[idx].vitality+0.14f*fabsf(w);
+        p->ex[idx].resonance=0.88f*p->ex[idx].resonance+0.12f*votes[idx];
+        p->ex[idx].overload=clampf(0.90f*p->ex[idx].overload+0.20f*((w-0.30f)>0?(w-0.30f):0),0,1);
+        p->ex[idx].low_steps=0;
+    }
+    for(int idx=0;idx<p->n;idx++) if(!picked[idx]){
+        float recovery=0.015f+0.03f*(1.0f-p->ex[idx].overload);
+        p->ex[idx].vitality=clampf(0.96f*p->ex[idx].vitality+recovery*clampf(fabsf(p->ex[idx].resonance),0,1),0,1);
+        p->ex[idx].overload*=0.92f;
+        p->ex[idx].low_steps++;
+    }
     for(int i=0;i<p->n;i++) free(outs[i]);
 }
 
@@ -1139,6 +1177,91 @@ static int is_boundary(const BPE *bpe, int id){
 static int starts_with_space(const BPE *bpe, int id){
     if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0)return 0;
     return bpe->vocab_bytes[id][0]==' ';
+}
+static int opens_segment(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size) return 1;
+    for(int i=bpe->vocab_len[id]-1;i>=0;i--){
+        uint8_t c=bpe->vocab_bytes[id][i];
+        if(c==' '||c=='\n'||c=='\r'||c=='\t') continue;
+        return c=='('||c=='['||c=='{'||c=='"'||c=='\''||c==':'||c==';';
+    }
+    return 1;
+}
+static int is_lower_fragment_start(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0) return 0;
+    uint8_t c=bpe->vocab_bytes[id][0];
+    return c!=' '&&c>='a'&&c<='z';
+}
+int is_clean_seed_token(const BPE *bpe, int id){
+    if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0) return 0;
+    if(starts_with_space(bpe,id)) return 1;
+    uint8_t c=bpe->vocab_bytes[id][0];
+    return !(c>='a'&&c<='z');
+}
+static float surface_transition_adjust(const BPE *bpe, int prev_id, int cur_id, int step){
+    if(cur_id<0||cur_id>=bpe->vocab_size) return 0.0f;
+    if(step==0) return is_lower_fragment_start(bpe,cur_id)?-1.15f:0.0f;
+    if(prev_id>=0&&(is_boundary(bpe,prev_id)||opens_segment(bpe,prev_id))){
+        if(is_lower_fragment_start(bpe,cur_id)) return -1.05f;
+        if(starts_with_space(bpe,cur_id)) return 0.06f;
+    }
+    return 0.0f;
+}
+static float surface_coherence_score(const BPE *bpe, const int *ids, int n){
+    if(n<=0) return -1.0f;
+    float score=surface_transition_adjust(bpe,-1,ids[0],0);
+    if(is_clean_seed_token(bpe,ids[0])) score+=0.18f;
+    int limit=n<12?n:12;
+    for(int i=1;i<limit;i++) score+=surface_transition_adjust(bpe,ids[i-1],ids[i],1);
+    return score;
+}
+static int display_start_index(const BPE *bpe, const int *ids, int n){
+    for(int i=0;i<n;i++){
+        char buf[128]; int len=bpe_decode_token(bpe,ids[i],buf,sizeof(buf));
+        if(len<=0) continue;
+        if(i==0 && (isalnum((unsigned char)buf[0]) || buf[0]=='"' || buf[0]=='\'' || buf[0]=='(' || buf[0]=='[' || buf[0]=='{')) return i;
+        if(isspace((unsigned char)buf[0])) return i;
+    }
+    return 0;
+}
+static float early_sentence_quality(const BPE *bpe, const int *ids, int n){
+    if(n<=0) return -1.0f;
+    float score=surface_coherence_score(bpe,ids,n);
+    if(n<8) score-=0.4f;
+    if(!is_clean_seed_token(bpe,ids[0])) score-=0.6f;
+    char text[256]={0}; int pos=0;
+    for(int i=0;i<n&&i<10;i++){
+        char buf[64]; int len=bpe_decode_token(bpe,ids[i],buf,sizeof(buf));
+        if(len>0&&pos+len<(int)sizeof(text)-1){memcpy(text+pos,buf,len);pos+=len;text[pos]=0;}
+    }
+    char *p=text; while(*p&&isspace((unsigned char)*p)) p++;
+    if(p[0]&&p[1]&&islower((unsigned char)p[0])) score-=0.4f;
+    if(strstr(p,"...")) score-=0.2f;
+    return score;
+}
+static float metaweights_field_scale(int step){
+    return clampf(0.55f + 0.045f * (float)step, 0.55f, 1.0f);
+}
+static float prompt_focus_scale(int has_tf, int plen, int step){
+    if(has_tf||plen<=1) return 1.0f;
+    if(step<=4) return 0.62f;
+    if(step<=8) return 0.82f;
+    return 1.0f;
+}
+static int anchored_prompt_from_input(const BPE *bpe, const char *text, int *out, int max_tokens){
+    int inp_ids[128];
+    int inp_n=bpe_encode(bpe,(const uint8_t*)text,(int)strlen(text),inp_ids,128);
+    if(inp_n<=0) return 0;
+    int start=0;
+    if(!is_clean_seed_token(bpe,inp_ids[start])){
+        int found=0;
+        for(int i=1;i<inp_n;i++) if(starts_with_space(bpe,inp_ids[i])&&is_clean_seed_token(bpe,inp_ids[i])){start=i;found=1;break;}
+        if(!found) for(int i=1;i<inp_n;i++) if(starts_with_space(bpe,inp_ids[i])){start=i;break;}
+    }
+    int n=inp_n-start; if(n>max_tokens) n=max_tokens;
+    if(n<=0) return 0;
+    for(int i=0;i<n;i++) out[i]=inp_ids[start+i];
+    return n;
 }
 
 /* ── generate sentence ── */
