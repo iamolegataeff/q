@@ -565,6 +565,90 @@ def ch_xfire(c, it):
                 if i != j:
                     c.act[i] += 0.03 * COU[i][j] * math.sin(old[j] - old[i])
             c.act[i] = clampf(c.act[i], 0.0, 1.0)
+# ── Somatic Sonar (micro-Klaus) ──
+#              word          FEAR  LOVE  RAGE  VOID  FLOW  CMPLX
+SOMATIC_SEEDS = {
+    "pulse":        (0.4, 0.0, 0.8, 0.0, 0.3, 0.2),
+    "warmth":       (0.0, 0.9, 0.0, 0.0, 0.6, 0.1),
+    "tremor":       (0.8, 0.0, 0.2, 0.2, 0.0, 0.3),
+    "chest":        (0.3, 0.5, 0.2, 0.0, 0.1, 0.1),
+    "jaw":          (0.2, 0.0, 0.7, 0.0, 0.0, 0.1),
+    "stomach":      (0.6, 0.0, 0.3, 0.2, 0.0, 0.2),
+    "breath":       (0.2, 0.3, 0.0, 0.0, 0.7, 0.1),
+    "burning":      (0.3, 0.1, 0.9, 0.0, 0.0, 0.2),
+    "floating":     (0.1, 0.4, 0.0, 0.5, 0.6, 0.3),
+    "tingling":     (0.3, 0.3, 0.0, 0.0, 0.5, 0.4),
+    "clenching":    (0.4, 0.0, 0.8, 0.0, 0.0, 0.1),
+    "hollow":       (0.2, 0.0, 0.0, 0.9, 0.0, 0.3),
+    "heaviness":    (0.3, 0.0, 0.2, 0.6, 0.0, 0.2),
+    "lightness":    (0.0, 0.5, 0.0, 0.1, 0.8, 0.2),
+    "nausea":       (0.7, 0.0, 0.3, 0.3, 0.0, 0.2),
+    "shiver":       (0.7, 0.1, 0.1, 0.1, 0.0, 0.3),
+    "ache":         (0.3, 0.2, 0.3, 0.4, 0.0, 0.2),
+    "tightness":    (0.5, 0.0, 0.6, 0.1, 0.0, 0.2),
+    "surge":        (0.2, 0.2, 0.5, 0.0, 0.7, 0.3),
+    "numbness":     (0.1, 0.0, 0.0, 0.8, 0.0, 0.4),
+    "pressure":     (0.4, 0.0, 0.5, 0.2, 0.0, 0.3),
+    "flutter":      (0.4, 0.4, 0.0, 0.0, 0.5, 0.2),
+    "grip":         (0.3, 0.0, 0.7, 0.0, 0.0, 0.2),
+    "release":      (0.0, 0.5, 0.0, 0.2, 0.8, 0.1),
+    "sweat":        (0.6, 0.0, 0.4, 0.0, 0.1, 0.2),
+    "chill":        (0.5, 0.0, 0.1, 0.4, 0.0, 0.3),
+    "throb":        (0.3, 0.1, 0.6, 0.0, 0.3, 0.2),
+    "sinking":      (0.5, 0.0, 0.0, 0.7, 0.0, 0.3),
+    "rush":         (0.2, 0.1, 0.4, 0.0, 0.8, 0.2),
+    "knot":         (0.4, 0.0, 0.5, 0.3, 0.0, 0.3),
+    "melting":      (0.0, 0.7, 0.0, 0.1, 0.6, 0.2),
+    "tension":      (0.4, 0.0, 0.6, 0.1, 0.0, 0.3),
+    "expansion":    (0.0, 0.4, 0.0, 0.0, 0.7, 0.5),
+    "constriction": (0.5, 0.0, 0.4, 0.3, 0.0, 0.4),
+    "vibration":    (0.1, 0.2, 0.1, 0.0, 0.6, 0.5),
+}
+def somatic_feel(c, text):
+    for word in extract_words(text):
+        aff = SOMATIC_SEEDS.get(word)
+        if aff is not None:
+            for k in range(6):
+                c.act[k] += 0.12 * aff[k]
+    for i in range(6):
+        c.act[i] = clampf(c.act[i], 0.0, 1.0)
+def compute_dissonance(mw, ids, V):
+    n = len(ids)
+    if n <= 1:
+        return 0.5
+    known = 0
+    for i in range(n - 1):
+        a, b = ids[i], ids[i + 1]
+        for bi in mw.bigrams:
+            if bi[0] == a and bi[1] == b:
+                known += 1
+                break
+    ratio = float(known) / float(n - 1)
+    return clampf(1.0 - ratio, 0.0, 1.0)
+VEL_STOP, VEL_WALK, VEL_RUN, VEL_UP = 0, 1, 2, 3
+VEL_NAMES = ["STOP", "WALK", "RUN", "UP"]
+def auto_velocity(dissonance):
+    if dissonance < 0.2:
+        return VEL_STOP
+    if dissonance < 0.5:
+        return VEL_WALK
+    if dissonance < 0.8:
+        return VEL_RUN
+    return VEL_UP
+def apply_velocity(vel, am, bm, gm, tm, temp):
+    if vel == VEL_STOP:
+        am *= 0.1
+    elif vel == VEL_RUN:
+        am *= 1.5; bm *= 1.2
+    elif vel == VEL_UP:
+        bm *= 2.0; gm *= 2.5
+    if vel >= VEL_RUN:
+        temp = clampf(temp + 0.08, 0.4, 0.85)
+    if vel == VEL_STOP:
+        temp = clampf(temp - 0.05, 0.4, 0.85)
+    am = clampf(am, 0.3, 2.0); bm = clampf(bm, 0.3, 2.0)
+    gm = clampf(gm, 0.3, 2.0); tm = clampf(tm, 0.3, 2.0)
+    return am, bm, gm, tm, temp
 class Interference:
     def __init__(self):
         self.docs = []
@@ -1058,7 +1142,7 @@ def starts_with_space(bpe, tid):
         return False
     return b[0] == ord(' ')
 # ── generate sentence ──
-def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr):
+def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr, somatic_vel=VEL_WALK):
     tf_reset(t)
     V = t.V; D = t.D
     destiny = [0.0] * D
@@ -1079,6 +1163,7 @@ def gen_sent(t, bpe, mw, prompt, plen, temp, maxo, parl, global_destiny, ch_ptr)
     am, bm, gm, tm = (1.0, 1.0, 1.0, 1.0)
     if ch_ptr is not None:
         am, bm, gm, tm = ch_ptr.modulate()
+    am, bm, gm, tm, temp = apply_velocity(somatic_vel, am, bm, gm, tm, temp)
 
     for step in range(120):
         if gl >= maxo:
@@ -1310,15 +1395,22 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     if nb >= CHAIN_STEPS:
         nb = CHAIN_STEPS - 1
 
+    # somatic dissonance + velocity (micro-Klaus sonar)
+    somatic_diss = 0.5
+    somatic_vel = VEL_WALK
     if input_text:
         inp_bytes = input_text.encode("utf-8", errors="replace")
-        ingest_ids(mw, bpe_encode(bpe, inp_bytes, len(inp_bytes), 512))
+        uids = bpe_encode(bpe, inp_bytes, len(inp_bytes), 512)
+        ingest_ids(mw, uids)
         ch.feel(input_text, periodic)
+        somatic_feel(ch, input_text)
+        somatic_diss = compute_dissonance(mw, uids, t.V)
+        somatic_vel = auto_velocity(somatic_diss)
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
         ch_xfire(ch, 8)
 
     mode_str = "[TRAINED]" if has_weights else "[METAWEIGHTS ONLY]"
-    print("\n  diss=%.3f debt=%.3f emrg=%.3f %s" % (cd, ch.debt, ch.emergence(), mode_str))
+    print("\n  diss=%.3f debt=%.3f emrg=%.3f somatic_d=%.3f vel=%s %s" % (cd, ch.debt, ch.emergence(), somatic_diss, VEL_NAMES[somatic_vel], mode_str))
     print("  chambers: %s" % ch.summary())
     if parl is not None:
         av = sum(e.vitality for e in parl.ex) / (parl.n if parl.n > 0 else 1)
@@ -1405,7 +1497,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         for cand in range(3):
             if cand > 0 and gdest_save is not None:
                 gdest[:] = list(gdest_save)
-            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch)
+            result = gen_sent(t, bpe, mw, prompt, pl, temp, 256, parl, gdest, ch, somatic_vel)
             sc = coherence_score(mw, result, len(result), t.V)
             if sc > best_sc:
                 best_sc = sc
@@ -1425,7 +1517,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 if longest["heavy"]:
                     prompt = [random.choice(longest["heavy"])]
                     direction = -direction if direction != 0 else 1
-                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch)
+                    best_out = gen_sent(t, bpe, mw, prompt, len(prompt), 0.55 if has_weights else 0.7, 256, parl, gdest, ch, somatic_vel)
                     best_ol = len(best_out)
                     best_sc = coherence_score(mw, best_out, best_ol, t.V)
 
@@ -1484,7 +1576,7 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
             nprom = min(3, chain_lens[seed_src])
             prompt = chain_ids[seed_src][chain_lens[seed_src] - nprom:chain_lens[seed_src]]
             reseed_temp = 0.55 if has_weights else 0.7
-            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch)
+            result = gen_sent(t, bpe, mw, prompt, nprom, reseed_temp, 256, parl, gdest, ch, somatic_vel)
             new_sc = coherence_score(mw, result, len(result), t.V)
             old_sc = coherence_score(mw, chain_ids[weak_idx], chain_lens[weak_idx], t.V)
             if new_sc > old_sc * 0.7 or len(result) > chain_lens[weak_idx]:  # accept if reasonable

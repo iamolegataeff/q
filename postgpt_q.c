@@ -359,6 +359,103 @@ static void ch_summary(const Chambers *c, char *buf, int sz){
     if(pos==0) snprintf(buf,sz,"quiet");
 }
 
+/* ── Somatic Sonar (micro-Klaus) ── */
+typedef struct{const char *word; float aff[6];}SomaticSeed;
+static const SomaticSeed SOMATIC_SEEDS[]={
+    /* word                FEAR  LOVE  RAGE  VOID  FLOW  CMPLX */
+    {"pulse",             {0.4f,0.0f,0.8f,0.0f,0.3f,0.2f}},
+    {"warmth",            {0.0f,0.9f,0.0f,0.0f,0.6f,0.1f}},
+    {"tremor",            {0.8f,0.0f,0.2f,0.2f,0.0f,0.3f}},
+    {"chest",             {0.3f,0.5f,0.2f,0.0f,0.1f,0.1f}},
+    {"jaw",               {0.2f,0.0f,0.7f,0.0f,0.0f,0.1f}},
+    {"stomach",           {0.6f,0.0f,0.3f,0.2f,0.0f,0.2f}},
+    {"breath",            {0.2f,0.3f,0.0f,0.0f,0.7f,0.1f}},
+    {"burning",           {0.3f,0.1f,0.9f,0.0f,0.0f,0.2f}},
+    {"floating",          {0.1f,0.4f,0.0f,0.5f,0.6f,0.3f}},
+    {"tingling",          {0.3f,0.3f,0.0f,0.0f,0.5f,0.4f}},
+    {"clenching",         {0.4f,0.0f,0.8f,0.0f,0.0f,0.1f}},
+    {"hollow",            {0.2f,0.0f,0.0f,0.9f,0.0f,0.3f}},
+    {"heaviness",         {0.3f,0.0f,0.2f,0.6f,0.0f,0.2f}},
+    {"lightness",         {0.0f,0.5f,0.0f,0.1f,0.8f,0.2f}},
+    {"nausea",            {0.7f,0.0f,0.3f,0.3f,0.0f,0.2f}},
+    {"shiver",            {0.7f,0.1f,0.1f,0.1f,0.0f,0.3f}},
+    {"ache",              {0.3f,0.2f,0.3f,0.4f,0.0f,0.2f}},
+    {"tightness",         {0.5f,0.0f,0.6f,0.1f,0.0f,0.2f}},
+    {"surge",             {0.2f,0.2f,0.5f,0.0f,0.7f,0.3f}},
+    {"numbness",          {0.1f,0.0f,0.0f,0.8f,0.0f,0.4f}},
+    {"pressure",          {0.4f,0.0f,0.5f,0.2f,0.0f,0.3f}},
+    {"flutter",           {0.4f,0.4f,0.0f,0.0f,0.5f,0.2f}},
+    {"grip",              {0.3f,0.0f,0.7f,0.0f,0.0f,0.2f}},
+    {"release",           {0.0f,0.5f,0.0f,0.2f,0.8f,0.1f}},
+    {"sweat",             {0.6f,0.0f,0.4f,0.0f,0.1f,0.2f}},
+    {"chill",             {0.5f,0.0f,0.1f,0.4f,0.0f,0.3f}},
+    {"throb",             {0.3f,0.1f,0.6f,0.0f,0.3f,0.2f}},
+    {"sinking",           {0.5f,0.0f,0.0f,0.7f,0.0f,0.3f}},
+    {"rush",              {0.2f,0.1f,0.4f,0.0f,0.8f,0.2f}},
+    {"knot",              {0.4f,0.0f,0.5f,0.3f,0.0f,0.3f}},
+    {"melting",           {0.0f,0.7f,0.0f,0.1f,0.6f,0.2f}},
+    {"tension",           {0.4f,0.0f,0.6f,0.1f,0.0f,0.3f}},
+    {"expansion",         {0.0f,0.4f,0.0f,0.0f,0.7f,0.5f}},
+    {"constriction",      {0.5f,0.0f,0.4f,0.3f,0.0f,0.4f}},
+    {"vibration",         {0.1f,0.2f,0.1f,0.0f,0.6f,0.5f}},
+};
+#define N_SOMATIC_SEEDS ((int)(sizeof(SOMATIC_SEEDS)/sizeof(SOMATIC_SEEDS[0])))
+
+static void somatic_feel(Chambers *c, const char *text){
+    char cur[32]={0}; int wi=0;
+    for(const char *p=text;;p++){
+        int ch=*p;
+        if(ch&&(isalpha((unsigned char)ch)||ch=='\'')){ if(wi<31) cur[wi++]=(char)tolower((unsigned char)ch); continue; }
+        if(wi>0){
+            cur[wi]=0;
+            for(int s=0;s<N_SOMATIC_SEEDS;s++){
+                if(strcmp(cur,SOMATIC_SEEDS[s].word)==0){
+                    for(int k=0;k<6;k++) c->act[k]+=0.12f*SOMATIC_SEEDS[s].aff[k];
+                    break;
+                }
+            }
+            wi=0;
+        }
+        if(!ch) break;
+    }
+    for(int i=0;i<6;i++) c->act[i]=clampf(c->act[i],0,1);
+}
+
+static float compute_dissonance(const MetaW *mw, const int *ids, int n, int V){
+    if(n<=1) return 0.5f;
+    int known=0;
+    for(int i=0;i<n-1;i++){
+        int a=ids[i],b=ids[i+1];
+        for(int j=0;j<mw->n_bi;j++){
+            if(mw->bigrams[j].a==a&&mw->bigrams[j].b==b){known++;break;}
+        }
+    }
+    float ratio=(float)known/(float)(n-1);
+    return clampf(1.0f-ratio,0.0f,1.0f);
+}
+
+enum{VEL_STOP=0,VEL_WALK,VEL_RUN,VEL_UP};
+static int auto_velocity(float dissonance){
+    if(dissonance<0.2f) return VEL_STOP;
+    if(dissonance<0.5f) return VEL_WALK;
+    if(dissonance<0.8f) return VEL_RUN;
+    return VEL_UP;
+}
+
+static void apply_velocity(int vel, float *am, float *bm, float *gm, float *tm, float *temp){
+    switch(vel){
+        case VEL_STOP: *am*=0.1f; break;
+        case VEL_WALK: break;
+        case VEL_RUN:  *am*=1.5f; *bm*=1.2f; break;
+        case VEL_UP:   *bm*=2.0f; *gm*=2.5f; break;
+    }
+    /* dissonance-based temperature nudge */
+    if(vel>=VEL_RUN) *temp=clampf(*temp+0.08f,0.4f,0.85f);
+    if(vel==VEL_STOP) *temp=clampf(*temp-0.05f,0.4f,0.85f);
+    *am=clampf(*am,0.3f,2.0f); *bm=clampf(*bm,0.3f,2.0f);
+    *gm=clampf(*gm,0.3f,2.0f); *tm=clampf(*tm,0.3f,2.0f);
+}
+
 typedef struct{char name[64]; int heavy[MAX_HEAVY]; int n_heavy;}InterferenceDoc;
 typedef struct{InterferenceDoc docs[MAX_INTERF_DOCS]; int n_docs;}Interference;
 static void interf_load(Interference *itf, const char *docs_dir, const BPE *bpe){
@@ -708,7 +805,7 @@ static int starts_with_space(const BPE *bpe, int id){
 static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
                     const int *prompt, int plen, float temp,
                     int *out, int maxo, Parliament *parl, float *global_destiny,
-                    Chambers *ch_ptr){
+                    Chambers *ch_ptr, int somatic_vel){
     tf_reset(t); int V=t->V,D=t->D;
     float *destiny=calloc(D,sizeof(float));
     /* inherit global destiny direction (thematic coherence across chain) */
@@ -718,6 +815,7 @@ static int gen_sent(TF *t, const BPE *bpe, MetaW *mw,
     int ctx[MAX_SEQ],cl=0,gl=0;
     float am=1.0f,bm=1.0f,gm=1.0f,tm=1.0f;
     if(ch_ptr) ch_modulate(ch_ptr,&am,&bm,&gm,&tm);
+    apply_velocity(somatic_vel,&am,&bm,&gm,&tm,&temp);
     for(int i=0;i<plen&&i<t->CTX-1;i++){tf_forward(t,prompt[i],i);ctx[cl++]=prompt[i];out[gl++]=prompt[i];}
     for(int step=0;step<120&&gl<maxo;step++){
         int pos=cl-1; if(pos>=t->CTX-1) break;
@@ -901,17 +999,23 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     int nb=(int)(CHAIN_STEPS*(0.3f+0.4f*ch->debt+0.1f*cd));
     if(nb<1)nb=1;if(nb>=CHAIN_STEPS)nb=CHAIN_STEPS-1;
 
+    /* somatic dissonance + velocity (micro-Klaus sonar) */
+    float somatic_diss=0.5f; int somatic_vel=VEL_WALK;
     if(input_text&&input_text[0]){
         int uids[512]; int ulen=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),uids,512);
         ingest_ids(mw,uids,ulen,0.02f);
         ch_feel_text(ch,input_text,pt);
+        somatic_feel(ch,input_text);
+        somatic_diss=compute_dissonance(mw,uids,ulen,t->V);
+        somatic_vel=auto_velocity(somatic_diss);
         ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]+0.1f,0,1);
         ch_xfire(ch,8);
     }
 
     char chbuf[256];
     ch_summary(ch,chbuf,sizeof(chbuf));
-    printf("\n  diss=%.3f debt=%.3f emrg=%.3f %s\n  chambers: %s",cd,ch->debt,ch_emergence(ch),has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
+    static const char *VEL_N[]={"STOP","WALK","RUN","UP"};
+    printf("\n  diss=%.3f debt=%.3f emrg=%.3f somatic_d=%.3f vel=%s %s\n  chambers: %s",cd,ch->debt,ch_emergence(ch),somatic_diss,VEL_N[somatic_vel],has_weights?"[TRAINED]":"[METAWEIGHTS ONLY]",chbuf);
     if(parl) {float av=0;for(int i=0;i<parl->n;i++) av+=parl->ex[i].vitality;av/=(parl->n>0?parl->n:1);
         printf("\n  parliament: %d experts, avg_vitality=%.2f",parl->n,av);}
     if(itf&&itf->n_docs>0) printf("\n  interference: %d docs loaded",itf->n_docs);
@@ -970,7 +1074,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
         for(int cand=0;cand<3;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,plen,temp,out,256,parl,gdest,ch,somatic_vel);
             float sc=coherence_score(mw,out,ol,t->V);
             if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
             if(best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
@@ -986,7 +1090,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                 if(doc->n_heavy>0){
                     int wh_prompt[1]={doc->heavy[rand()%doc->n_heavy]};
                     dir=dir!=0?-dir:1;
-                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch);
+                    best_ol=gen_sent(t,bpe,mw,wh_prompt,1,has_weights?0.55f:0.7f,best_out,256,parl,gdest,ch,somatic_vel);
                     best_sc=coherence_score(mw,best_out,best_ol,t->V);
                 }
             }
@@ -1025,7 +1129,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             int seed_src=weak_idx>0?weak_idx-1:(weak_idx<CHAIN_STEPS-1?weak_idx+1:0);
             int nprom=chain_lens[seed_src]>3?3:chain_lens[seed_src];
             int prompt[5]; for(int i=0;i<nprom;i++) prompt[i]=chain_ids[seed_src][chain_lens[seed_src]-nprom+i];
-            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch);
+            int out[256],ol=gen_sent(t,bpe,mw,prompt,nprom,has_weights?0.55f:0.7f,out,256,parl,gdest,ch,somatic_vel);
             float new_sc=coherence_score(mw,out,ol,t->V);
             float old_sc=coherence_score(mw,chain_ids[weak_idx],chain_lens[weak_idx],t->V);
             if(new_sc>old_sc*0.7f||ol>chain_lens[weak_idx]){ /* accept if reasonable */
