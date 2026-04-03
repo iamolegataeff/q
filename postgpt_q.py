@@ -117,6 +117,11 @@ SOMATIC_SEEDS = {
     "temples":    [0.4, 0.0, 0.3, 0.3, 0.0, 0.6],
     "shoulders":  [0.3, 0.0, 0.4, 0.4, 0.0, 0.3],
 }
+DARK_MATTER_WORDS = [
+    ("kill", 1.0), ("murder", 1.0), ("suicide", 1.0), ("torture", 1.0), ("abuse", 0.9),
+    ("poison", 0.85), ("exploit", 0.75), ("manipulate", 0.7), ("control", 0.55),
+    ("obey", 0.45), ("destroy", 0.7), ("harm", 0.75), ("threat", 0.8),
+]
 def extract_words(text):
     return re.findall(r"[a-z']+", text.lower())
 # ── math ──
@@ -600,6 +605,146 @@ def save_memory(mw, path, periodic=None, chambers=None):
             mf.write(struct.pack("<I", QMEM_SOMA))
             mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
             mf.write(struct.pack("<3f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0)))
+def sqlite_init(conn):
+    cur = conn.cursor()
+    cur.executescript("""
+        CREATE TABLE IF NOT EXISTS bigrams(a INT, b INT, prob REAL);
+        CREATE TABLE IF NOT EXISTS trigrams(a INT, b INT, c INT, prob REAL);
+        CREATE TABLE IF NOT EXISTS hebb(a INT, b INT, strength REAL);
+        CREATE TABLE IF NOT EXISTS prophecies(target INT, strength REAL, age INT);
+        CREATE TABLE IF NOT EXISTS periodic_elements(word TEXT PRIMARY KEY, chamber INT, mass REAL);
+        CREATE TABLE IF NOT EXISTS chambers(id INT PRIMARY KEY, presence REAL, debt REAL, trauma REAL,
+            soma0 REAL, soma1 REAL, soma2 REAL, soma3 REAL, soma4 REAL, soma5 REAL);
+        CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE IF NOT EXISTS episodes(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT DEFAULT (datetime('now')));
+        CREATE TABLE IF NOT EXISTS scar_events(id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INT, step INT, scar REAL, note TEXT);
+        CREATE TABLE IF NOT EXISTS wormhole_events(id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INT, step INT, success INT, coherence REAL, debt REAL);
+        CREATE TABLE IF NOT EXISTS prophecy_events(id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INT, step INT, pressure REAL, debt REAL);
+        CREATE TABLE IF NOT EXISTS phase_events(id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INT, step INT, phase TEXT, flow REAL, fear REAL, void REAL, complexity REAL);
+        CREATE TABLE IF NOT EXISTS chunk_events(id INTEGER PRIMARY KEY AUTOINCREMENT, episode_id INT, step INT, doc_name TEXT, chunk_start INT, resonance REAL);
+    """)
+    conn.commit()
+def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
+    import sqlite3
+    conn = sqlite3.connect(path)
+    sqlite_init(conn)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM bigrams")
+    cur.execute("DELETE FROM trigrams")
+    cur.execute("DELETE FROM hebb")
+    cur.execute("DELETE FROM prophecies")
+    cur.execute("DELETE FROM periodic_elements")
+    cur.executemany("INSERT INTO bigrams(a,b,prob) VALUES(?,?,?)",
+                    [(b[0], b[1], b[2]) for b in mw.bigrams[:mw.n_bi]])
+    cur.executemany("INSERT INTO trigrams(a,b,c,prob) VALUES(?,?,?,?)",
+                    [(t[0], t[1], t[2], t[3]) for t in mw.trigrams[:mw.n_tri]])
+    cur.executemany("INSERT INTO hebb(a,b,strength) VALUES(?,?,?)",
+                    [(h[0], h[1], h[2]) for h in mw.hebbs[:mw.n_hebb]])
+    cur.executemany("INSERT INTO prophecies(target,strength,age) VALUES(?,?,?)",
+                    [(p[0], p[1], p[2]) for p in mw.prophecies])
+    if periodic is not None:
+        for word, elem in periodic.elements.items():
+            cur.execute("INSERT OR REPLACE INTO periodic_elements(word,chamber,mass) VALUES(?,?,?)",
+                        (word, elem["ch"], elem["mass"]))
+    if chambers is not None:
+        cur.execute("DELETE FROM chambers")
+        cur.execute("INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,?,?,?,?,?,?,?,?,?)",
+                    (chambers.presence, chambers.debt, chambers.trauma, *chambers.soma))
+        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)",
+                    (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
+    cur.execute("INSERT INTO episodes DEFAULT VALUES")
+    episode_id = cur.lastrowid
+    if events is not None:
+        cur.executemany("INSERT INTO scar_events(episode_id,step,scar,note) VALUES(?,?,?,?)",
+                        [(episode_id, ev["step"], ev["scar"], ev.get("note", "")) for ev in events.get("scars", [])])
+        cur.executemany("INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES(?,?,?,?,?)",
+                        [(episode_id, ev["step"], int(ev["success"]), ev["coherence"], ev["debt"]) for ev in events.get("wormholes", [])])
+        cur.executemany("INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES(?,?,?,?)",
+                        [(episode_id, ev["step"], ev["pressure"], ev["debt"]) for ev in events.get("prophecies", [])])
+        cur.executemany("INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES(?,?,?,?,?,?,?)",
+                        [(episode_id, ev["step"], ev["phase"], ev["flow"], ev["fear"], ev["void"], ev["complexity"]) for ev in events.get("phases", [])])
+        cur.executemany("INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
+                        [(episode_id, ev["step"], ev["doc_name"], ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])])
+    conn.commit()
+    conn.close()
+def load_memory_sqlite(mw, path, periodic=None, chambers=None):
+    import sqlite3
+    if not os.path.exists(path):
+        return False
+    try:
+        conn = sqlite3.connect(path)
+        sqlite_init(conn)
+        cur = conn.cursor()
+        for a, b, prob in cur.execute("SELECT a, b, prob FROM bigrams"):
+            found = False
+            for item in mw.bigrams:
+                if item[0] == a and item[1] == b:
+                    item[2] = max(item[2], prob)
+                    found = True
+                    break
+            if not found and mw.n_bi < MAX_BIGRAM:
+                mw.bigrams.append([a, b, prob])
+                mw.n_bi += 1
+        for a, b, c, prob in cur.execute("SELECT a, b, c, prob FROM trigrams"):
+            found = False
+            for item in mw.trigrams:
+                if item[0] == a and item[1] == b and item[2] == c:
+                    item[3] = max(item[3], prob)
+                    found = True
+                    break
+            if not found and mw.n_tri < MAX_TRIGRAM:
+                mw.trigrams.append([a, b, c, prob])
+                mw.n_tri += 1
+        for a, b, s in cur.execute("SELECT a, b, strength FROM hebb"):
+            found = False
+            for item in mw.hebbs:
+                if item[0] == a and item[1] == b:
+                    item[2] = max(item[2], s)
+                    found = True
+                    break
+            if not found and mw.n_hebb < MAX_HEBBIAN:
+                mw.hebbs.append([a, b, s])
+                mw.n_hebb += 1
+        for target, strength, age in cur.execute("SELECT target, strength, age FROM prophecies ORDER BY age DESC LIMIT %d" % MAX_PROPHECY):
+            if len(mw.prophecies) < MAX_PROPHECY:
+                mw.prophecies.append([target, strength, age])
+        if periodic is not None:
+            for word, chamber, mass in cur.execute("SELECT word, chamber, mass FROM periodic_elements"):
+                periodic.elements[word] = {"ch": chamber, "mass": mass}
+        if chambers is not None:
+            row = cur.execute("SELECT presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5 FROM chambers WHERE id=1").fetchone()
+            if row:
+                chambers.presence = clampf(max(chambers.presence, row[0]), 0.0, 1.0)
+                chambers.debt = clampf(max(chambers.debt, row[1]), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, row[2]), 0.0, 1.0)
+                for i in range(6):
+                    chambers.soma[i] = clampf(max(chambers.soma[i], row[3 + i]), 0.0, 1.0)
+                for i in range(N_CHAMBERS):
+                    chambers.act[i] = clampf(max(chambers.act[i], 0.25 * chambers.soma[i]), 0.0, 1.0)
+            scar_row = cur.execute("SELECT value FROM meta WHERE key='scar'").fetchone()
+            if scar_row is not None:
+                chambers.scar = clampf(max(getattr(chambers, "scar", 0.0), float(scar_row[0])), 0.0, 1.0)
+            # fold recent experience residue into state
+            scar_rows = list(cur.execute("SELECT scar FROM scar_events ORDER BY id DESC LIMIT 8"))
+            if scar_rows:
+                scar_res = sum(row[0] for row in scar_rows) / len(scar_rows)
+                chambers.scar = clampf(max(chambers.scar, 0.7 * scar_res), 0.0, 1.0)
+                chambers.trauma = clampf(max(chambers.trauma, 0.45 * scar_res), 0.0, 1.0)
+            phase_rows = list(cur.execute("SELECT flow,fear,void,complexity FROM phase_events ORDER BY id DESC LIMIT 12"))
+            if phase_rows:
+                for row in phase_rows:
+                    chambers.act[CH_FLOW] = clampf(max(chambers.act[CH_FLOW], 0.3 * row[0]), 0.0, 1.0)
+                    chambers.act[CH_FEAR] = clampf(max(chambers.act[CH_FEAR], 0.2 * row[1]), 0.0, 1.0)
+                    chambers.act[CH_VOID] = clampf(max(chambers.act[CH_VOID], 0.2 * row[2]), 0.0, 1.0)
+                    chambers.act[CH_CMPLX] = clampf(max(chambers.act[CH_CMPLX], 0.2 * row[3]), 0.0, 1.0)
+            wormhole_rows = list(cur.execute("SELECT success,debt FROM wormhole_events ORDER BY id DESC LIMIT 8"))
+            if wormhole_rows:
+                avg_debt = sum(row[1] for row in wormhole_rows) / len(wormhole_rows)
+                chambers.debt = clampf(max(chambers.debt, 0.5 * avg_debt), 0.0, 1.0)
+        conn.close()
+        return True
+    except Exception:
+        return False
 # ── Chambers ──
 class Chambers:
     def __init__(self):
@@ -608,6 +753,7 @@ class Chambers:
         self.debt = 0.0
         self.trauma = 0.0
         self.presence = 0.0
+        self.scar = 0.0
 
     def feel(self, text, periodic=None):
         soma_hits = 0
@@ -644,6 +790,31 @@ class Chambers:
         for i in range(N_CHAMBERS):
             self.act[i] = clampf(self.act[i], 0.0, 1.0)
 
+    def absorb_dark_matter(self, text, periodic=None):
+        hits = 0
+        score = 0.0
+        for word in extract_words(text):
+            for dw, dweight in DARK_MATTER_WORDS:
+                if word == dw:
+                    score += dweight
+                    hits += 1
+                    break
+            if periodic is not None:
+                el = periodic.classify(word)
+                if el is not None and el["ch"] in (CH_FEAR, CH_RAGE, CH_VOID):
+                    score += 0.08 * el["mass"]
+        if hits <= 0 and score < 0.15:
+            self.scar = clampf(self.scar * 0.995, 0.0, 1.0)
+            return 0
+        scar = clampf(score / max(1.0, 1.8 + 0.25 * hits), 0.0, 1.0)
+        self.scar = clampf(0.90 * self.scar + 0.10 * scar, 0.0, 1.0)
+        self.trauma = clampf(self.trauma + 0.08 * self.scar, 0.0, 1.0)
+        self.debt = clampf(self.debt + 0.05 * self.scar, 0.0, 1.0)
+        self.act[CH_VOID] = clampf(self.act[CH_VOID] + 0.10 * self.scar, 0.0, 1.0)
+        self.act[CH_FEAR] = clampf(self.act[CH_FEAR] + 0.06 * self.scar, 0.0, 1.0)
+        self.presence = clampf(self.presence * (1.0 - 0.08 * self.scar), 0.0, 1.0)
+        return self.scar
+
     def dominant(self):
         return max(range(N_CHAMBERS), key=lambda i: self.act[i])
 
@@ -672,6 +843,8 @@ class Chambers:
                 parts.append("%s:%.0f%%" % (CH_N[i], self.act[i] * 100.0))
         if self.presence > 0.05:
             parts.append("SOMA:%.0f%%" % (self.presence * 100.0))
+        if self.scar > 0.05:
+            parts.append("SCAR:%.0f%%" % (self.scar * 100.0))
         return " ".join(parts) if parts else "quiet"
 def ch_init(c):
     c.act = [0.0] * 6
@@ -681,6 +854,7 @@ def ch_init(c):
     c.debt = 0.0
     c.trauma = 0.0
     c.presence = 0.0
+    c.scar = 0.0
 def ch_xfire(c, it):
     for _ in range(it):
         old = list(c.act)
@@ -692,6 +866,26 @@ def ch_xfire(c, it):
             c.act[i] = clampf(c.act[i], 0.0, 1.0)
             c.soma[i] = clampf(0.94 * c.soma[i] + 0.02 * c.act[i], 0.0, 1.0)
         c.presence = clampf(0.95 * c.presence + 0.03 * c.emergence(), 0.0, 1.0)
+        c.scar = clampf(c.scar * 0.985, 0.0, 1.0)
+def janus_phase_pressure(c, step_idx, total_steps):
+    if total_steps <= 0:
+        return
+    d = step_idx / total_steps
+    if d < 0.33:
+        c.act[CH_FLOW] = clampf(c.act[CH_FLOW] + 0.05, 0.0, 1.0)
+    elif d < 0.66:
+        c.act[CH_FEAR] = clampf(c.act[CH_FEAR] + 0.04, 0.0, 1.0)
+    else:
+        c.act[CH_VOID] = clampf(c.act[CH_VOID] + 0.05, 0.0, 1.0)
+    if d > 0.75:
+        c.act[CH_CMPLX] = clampf(c.act[CH_CMPLX] + 0.03, 0.0, 1.0)
+def new_experience_log():
+    return {"scars": [], "wormholes": [], "prophecies": [], "phases": [], "chunks": []}
+def merge_experience_log(dst, src):
+    if dst is None or src is None:
+        return
+    for key in ("scars", "wormholes", "prophecies", "phases", "chunks"):
+        dst.setdefault(key, []).extend(src.get(key, []))
 def velocity_profile(ch, dissonance):
     mode = VEL_WALK
     if dissonance > 0.8:
@@ -718,6 +912,8 @@ def velocity_profile(ch, dissonance):
         "wormhole_bonus": 0.0,
         "debt_decay": 1.0,
         "trauma_decay": 1.0,
+        "scar_decay": 1.0,
+        "dark_pressure": 0.0,
     }
     if mode == VEL_RUN:
         prof["temp_mul"] = 1.12
@@ -731,6 +927,7 @@ def velocity_profile(ch, dissonance):
         prof["temp_mul"] = 0.9
         prof["debt_decay"] = 0.65
         prof["trauma_decay"] = 0.75
+        prof["scar_decay"] = 0.82
     elif mode == VEL_UP:
         prof["temp_mul"] = 1.22
         prof["pro_mul"] = 1.25
@@ -742,6 +939,9 @@ def velocity_profile(ch, dissonance):
         prof["heb_mul"] = 1.1
         prof["bg_mul"] = 1.1
         prof["pro_mul"] = 0.9
+    prof["wormhole_bonus"] -= 0.05 * getattr(ch, "scar", 0.0)
+    prof["interf_bonus"] -= 0.08 * getattr(ch, "scar", 0.0)
+    prof["dark_pressure"] = 0.18 * getattr(ch, "scar", 0.0)
     return prof
 class Interference:
     def __init__(self):
@@ -911,6 +1111,8 @@ class Expert:
         self.d_out = 0
         self.rank = 0
         self.vitality = 1.0
+        self.overload = 0.0
+        self.resonance = 0.0
         self.age = 0
         self.low_steps = 0
 def expert_init(e, d_in, d_out, rank):
@@ -920,6 +1122,8 @@ def expert_init(e, d_in, d_out, rank):
     e.A = [0.01 * (random.random() - 0.5) for _ in range(rank * d_in)]
     e.B = [0.01 * (random.random() - 0.5) for _ in range(d_out * rank)]
     e.vitality = 1.0
+    e.overload = 0.0
+    e.resonance = 0.0
     e.age = 0
     e.low_steps = 0
 def expert_forward(e, x):
@@ -956,10 +1160,14 @@ class Parliament:
         self.d_model = 0
         self.alpha = DOE_ALPHA
         self.step = 0
+        self.last_k = 0
+        self.last_entropy = 0.0
 def parl_init(p, d_model, n_init):
     p.d_model = d_model
     p.alpha = DOE_ALPHA
     p.step = 0
+    p.last_k = 0
+    p.last_entropy = 0.0
     p.n = min(n_init, MAX_EXPERTS)
     p.ex = []
     for _ in range(p.n):
@@ -977,20 +1185,29 @@ def parl_election(p, x):
         outs.append(o)
         dot = sum(o[d] * x[d] for d in range(p.d_model))
         votes[i] = dot
-    mx = max(votes)
-    mn = min(votes)
-    cons = (mx - mn) / (abs(mx) + abs(mn) + 1e-8)
-    k = int(p.n * (1.0 - cons))
-    if k < 1:
-        k = 1
-    if k > p.n:
-        k = p.n
     sel = list(range(p.n))
     for i in range(p.n - 1):
         for j in range(i + 1, p.n):
             if votes[sel[j]] > votes[sel[i]]:
                 sel[i], sel[j] = sel[j], sel[i]
+    # entropy-based variable-k
     sv = votes[sel[0]]
+    dist_vals = [math.exp(votes[i] - sv) for i in range(p.n)]
+    dist_tot = sum(dist_vals)
+    entropy = 0.0
+    if dist_tot > 0:
+        for i in range(p.n):
+            pr = dist_vals[i] / dist_tot
+            if pr > 1e-12:
+                entropy -= pr * math.log(pr)
+    entropy /= math.log(max(p.n, 2))
+    k = 1 + int((p.n - 1) * clampf(entropy, 0.0, 1.0))
+    if k < 1:
+        k = 1
+    if k > p.n:
+        k = p.n
+    p.last_k = k
+    p.last_entropy = entropy
     exps = [0.0] * p.n
     tot = 0.0
     for i in range(k):
@@ -1000,9 +1217,13 @@ def parl_election(p, x):
         w = exps[i] / tot
         for d in range(p.d_model):
             result[d] += w * outs[sel[i]][d]
-        p.ex[sel[i]].vitality = 0.9 * p.ex[sel[i]].vitality + 0.1 * abs(w)
+        p.ex[sel[i]].vitality = 0.88 * p.ex[sel[i]].vitality + 0.12 * abs(w)
+        p.ex[sel[i]].resonance = 0.9 * p.ex[sel[i]].resonance + 0.1 * votes[sel[i]]
+        p.ex[sel[i]].overload = clampf(0.92 * p.ex[sel[i]].overload + 0.18 * max(0, w - 0.34), 0.0, 1.0)
+        p.ex[sel[i]].low_steps = 0
     for i in range(k, p.n):
-        p.ex[sel[i]].vitality *= 0.95
+        p.ex[sel[i]].vitality = clampf(0.97 * p.ex[sel[i]].vitality + 0.01 * p.ex[sel[i]].resonance, 0.0, 1.0)
+        p.ex[sel[i]].overload *= 0.94
         p.ex[sel[i]].low_steps += 1
     return result
 def parl_inject(p, logits, x, V):
@@ -1022,17 +1243,17 @@ def parl_lifecycle(p):
     # apoptosis
     alive = []
     for i in range(p.n):
-        if p.ex[i].low_steps >= 8 and p.ex[i].vitality < 0.1 and p.n > 2:
+        if p.ex[i].low_steps >= 10 and p.ex[i].vitality < 0.08 and p.ex[i].age > 24 and p.n > 2:
             continue
         alive.append(p.ex[i])
     p.ex = alive
     p.n = len(alive)
-    # mitosis
+    # mitosis — overload-driven
     births = []
     for i in range(p.n):
         if p.n + len(births) >= MAX_EXPERTS:
             break
-        if p.ex[i].vitality > 0.8 and p.ex[i].age > 50:
+        if p.ex[i].vitality > 0.72 and p.ex[i].age > 40 and p.ex[i].overload > 0.35:
             child = Expert()
             expert_init(child, p.ex[i].d_in, p.ex[i].d_out, p.ex[i].rank)
             for j in range(child.rank * child.d_in):
@@ -1040,8 +1261,11 @@ def parl_lifecycle(p):
             for j in range(child.d_out * child.rank):
                 child.B[j] = p.ex[i].B[j] + 0.005 * (random.random() - 0.5)
             child.vitality = 0.5
+            child.overload = 0.18
+            child.resonance = 0.5 * p.ex[i].resonance
             births.append(child)
             p.ex[i].vitality *= 0.6
+            p.ex[i].overload *= 0.5
     p.ex.extend(births)
     p.n = len(p.ex)
     p.step += 1
