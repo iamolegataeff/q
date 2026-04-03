@@ -942,6 +942,11 @@ function genSentence(prompt,temp,gdest){
   let prevChosen=-1;
   const ctx=[...prompt],out=[...prompt];
   const mod=chambers?chambers.modulate():{a:1,b:1,g:1,t:1};
+  // apply somatic velocity to coefficients (matches C apply_velocity)
+  if(typeof somaticVel!=='undefined'&&typeof somatic!=='undefined'){
+    const baseTemp=temp;
+    somatic.applyVelocity(somaticVel,mod,baseTemp);
+  }
   // token embeddings: from transformer or zero (matches C zero-weight fallback)
   const tokEmb=tf&&tf.loaded?tf.tok:_zeroTok(V,D);
 
