@@ -32,6 +32,7 @@
 #define CHAIN_STEPS  12
 #define TOP_K        15
 #define QPTQ_MAGIC   0x51505451
+#define QMEM_SOMA    0x414D4F53
 #define MAX_PERIODIC 4096
 #define MAX_INTERF_DOCS 32
 #define MAX_HEAVY 32
@@ -278,16 +279,37 @@ static const Anchor ANCHORS[]={
     {"chaos",CH_CMPLX},{"mystery",CH_CMPLX},{"transform",CH_CMPLX},
     {"strange",CH_CMPLX},{"ambiguity",CH_CMPLX},{"uncertain",CH_CMPLX}
 };
+typedef struct{const char *word; float vec[6];}SomaticSeed;
+static const SomaticSeed SOMATIC_SEEDS[]={
+    {"pulse",{0.4f,0.0f,0.8f,0.0f,0.3f,0.2f}},{"tremor",{0.8f,0.0f,0.2f,0.2f,0.0f,0.3f}},
+    {"burning",{0.3f,0.1f,0.9f,0.0f,0.1f,0.2f}},{"clenching",{0.4f,0.0f,0.8f,0.1f,0.0f,0.3f}},
+    {"tingling",{0.5f,0.2f,0.1f,0.0f,0.4f,0.5f}},{"throbbing",{0.3f,0.0f,0.7f,0.1f,0.3f,0.2f}},
+    {"aching",{0.2f,0.1f,0.2f,0.7f,0.0f,0.3f}},{"tightness",{0.6f,0.0f,0.5f,0.3f,0.0f,0.3f}},
+    {"sinking",{0.5f,0.0f,0.0f,0.9f,0.0f,0.2f}},{"nausea",{0.5f,0.0f,0.2f,0.7f,0.0f,0.3f}},
+    {"heaviness",{0.2f,0.0f,0.1f,0.8f,0.0f,0.2f}},{"weakness",{0.5f,0.0f,0.0f,0.7f,0.0f,0.2f}},
+    {"shaking",{0.8f,0.0f,0.4f,0.1f,0.0f,0.3f}},{"freezing",{0.7f,0.0f,0.0f,0.5f,0.0f,0.2f}},
+    {"sweating",{0.6f,0.0f,0.3f,0.1f,0.2f,0.2f}},{"warmth",{0.0f,0.9f,0.0f,0.0f,0.6f,0.1f}},
+    {"softness",{0.0f,0.8f,0.0f,0.0f,0.5f,0.2f}},{"floating",{0.0f,0.3f,0.0f,0.2f,0.8f,0.3f}},
+    {"pressure",{0.4f,0.0f,0.5f,0.5f,0.0f,0.4f}},{"vibrating",{0.2f,0.1f,0.3f,0.0f,0.4f,0.8f}},
+    {"chest",{0.4f,0.5f,0.4f,0.3f,0.2f,0.3f}},{"throat",{0.6f,0.2f,0.3f,0.5f,0.0f,0.3f}},
+    {"stomach",{0.5f,0.1f,0.3f,0.6f,0.1f,0.3f}},{"jaw",{0.2f,0.0f,0.9f,0.1f,0.0f,0.2f}},
+    {"fists",{0.1f,0.0f,0.9f,0.0f,0.0f,0.2f}},{"spine",{0.7f,0.0f,0.2f,0.2f,0.1f,0.4f}},
+    {"temples",{0.4f,0.0f,0.3f,0.3f,0.0f,0.6f}},{"shoulders",{0.3f,0.0f,0.4f,0.4f,0.0f,0.3f}}
+};
 typedef struct{char word[32]; int chamber; float mass;}PeriodicElement;
 typedef struct{PeriodicElement elements[MAX_PERIODIC]; int n;}PeriodicTable;
-typedef struct{float act[6];float debt;float trauma;}Chambers;
+typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;}Chambers;
 
 static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
 static void ch_xfire(Chambers *c, int it){
     for(int t=0;t<it;t++){float old[6];memcpy(old,c->act,sizeof(old));
         for(int i=0;i<6;i++){c->act[i]*=CH_D[i];
             for(int j=0;j<6;j++) if(i!=j) c->act[i]+=0.03f*COU[i][j]*sinf(old[j]-old[i]);
-            c->act[i]=clampf(c->act[i],0,1);}
+            c->act[i]=clampf(c->act[i],0,1);
+            c->soma[i]=clampf(0.94f*c->soma[i]+0.02f*c->act[i],0,1);}
+        c->presence=clampf(0.95f*c->presence
+            +0.02f*((1.0f-(c->act[CH_VOID]>0.10f?c->act[CH_VOID]:0.10f))*(c->act[CH_FLOW]<0.95f?c->act[CH_FLOW]:0.95f))
+            +0.01f*(0.35f*c->soma[CH_LOVE]+0.30f*c->soma[CH_FLOW]+0.20f*c->soma[CH_CMPLX]+0.15f*c->soma[CH_VOID]),0,1);
     }
 }
 static int periodic_find(const PeriodicTable *pt, const char *word){
@@ -331,7 +353,7 @@ static void periodic_build_from_text(PeriodicTable *pt, const char *text){
     }
 }
 static void ch_feel_text(Chambers *c, const char *text, const PeriodicTable *pt){
-    char cur[32]={0}; int wi=0;
+    char cur[32]={0}; int wi=0, soma_hits=0; float soma_mix[6]={0};
     for(const char *p=text;;p++){
         int ch=*p;
         if(ch&&(isalpha((unsigned char)ch)||ch=='\'')){ if(wi<31) cur[wi++]=(char)tolower((unsigned char)ch); continue; }
@@ -339,10 +361,31 @@ static void ch_feel_text(Chambers *c, const char *text, const PeriodicTable *pt)
             cur[wi]=0;
             for(size_t i=0;i<sizeof(ANCHORS)/sizeof(ANCHORS[0]);i++) if(strcmp(cur,ANCHORS[i].word)==0) c->act[ANCHORS[i].chamber]+=0.15f;
             if(pt){ int idx=periodic_find(pt,cur); if(idx>=0) c->act[pt->elements[idx].chamber]+=0.08f*pt->elements[idx].mass; }
+            for(size_t i=0;i<sizeof(SOMATIC_SEEDS)/sizeof(SOMATIC_SEEDS[0]);i++) if(strcmp(cur,SOMATIC_SEEDS[i].word)==0){
+                soma_hits++;
+                for(int k=0;k<6;k++) soma_mix[k]+=SOMATIC_SEEDS[i].vec[k];
+                break;
+            }
             wi=0;
         }
         if(!ch) break;
     }
+    if(soma_hits>0){
+        float inv=1.0f/(float)soma_hits;
+        float intensity=0;
+        for(int i=0;i<6;i++){
+            float avg=soma_mix[i]*inv;
+            c->soma[i]=clampf(0.82f*c->soma[i]+0.18f*avg,0,1);
+            c->act[i]+=0.06f*avg;
+            intensity+=avg;
+        }
+        c->presence=clampf(0.86f*c->presence+0.14f*clampf(intensity/2.4f,0,1),0,1);
+    }else{
+        for(int i=0;i<6;i++) c->soma[i]*=0.98f;
+        c->presence*=0.99f;
+    }
+    c->trauma=clampf(0.92f*c->trauma+0.08f*(0.45f*c->soma[CH_FEAR]+0.35f*c->soma[CH_RAGE]+0.20f*c->soma[CH_VOID]),0,1);
+    c->debt=clampf(0.96f*c->debt+0.04f*(0.35f*c->soma[CH_CMPLX]+0.25f*c->soma[CH_FLOW]+0.20f*c->presence),0,1);
     for(int i=0;i<6;i++) c->act[i]=clampf(c->act[i],0,1);
 }
 static int ch_dominant(const Chambers *c){int dom=0;for(int i=1;i<6;i++) if(c->act[i]>c->act[dom]) dom=i;return dom;}
@@ -352,73 +395,16 @@ static void ch_modulate(const Chambers *c, float *a, float *b, float *g, float *
     *b=clampf(1.0f+0.4f*c->act[CH_FLOW]-0.2f*c->act[CH_FEAR],0.3f,2.0f);
     *g=clampf(1.0f+0.5f*c->act[CH_CMPLX]+0.2f*c->act[CH_LOVE]-0.1f*c->act[CH_VOID],0.3f,2.0f);
     *t=clampf(1.0f-0.2f*c->act[CH_FLOW]+0.1f*c->act[CH_FEAR],0.3f,2.0f);
+    *a=clampf(*a*clampf(1.0f+0.14f*c->soma[CH_LOVE]+0.08f*c->soma[CH_FLOW]+0.05f*c->presence,0.7f,1.5f),0.3f,2.0f);
+    *b=clampf(*b*clampf(1.0f+0.10f*c->soma[CH_FLOW]+0.08f*c->soma[CH_CMPLX]+0.04f*c->presence,0.7f,1.5f),0.3f,2.0f);
+    *g=clampf(*g*clampf(1.0f+0.10f*c->soma[CH_CMPLX]+0.05f*c->soma[CH_VOID]+0.06f*c->presence,0.7f,1.5f),0.3f,2.0f);
+    *t=clampf(*t*clampf(1.0f-0.10f*c->soma[CH_FLOW]+0.08f*c->soma[CH_FEAR]+0.06f*c->soma[CH_RAGE],0.7f,1.5f),0.3f,2.0f);
 }
 static void ch_summary(const Chambers *c, char *buf, int sz){
     int pos=0; buf[0]=0;
     for(int i=0;i<6;i++) if(c->act[i]>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);if(w>0&&pos+w<sz)pos+=w;else break;}
+    if(c->presence>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSOMA:%.0f%%",pos?" ":"",c->presence*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(pos==0) snprintf(buf,sz,"quiet");
-}
-
-/* ── Somatic Sonar (micro-Klaus) ── */
-typedef struct{const char *word; float aff[6];}SomaticSeed;
-static const SomaticSeed SOMATIC_SEEDS[]={
-    /* word                FEAR  LOVE  RAGE  VOID  FLOW  CMPLX */
-    {"pulse",             {0.4f,0.0f,0.8f,0.0f,0.3f,0.2f}},
-    {"warmth",            {0.0f,0.9f,0.0f,0.0f,0.6f,0.1f}},
-    {"tremor",            {0.8f,0.0f,0.2f,0.2f,0.0f,0.3f}},
-    {"chest",             {0.3f,0.5f,0.2f,0.0f,0.1f,0.1f}},
-    {"jaw",               {0.2f,0.0f,0.7f,0.0f,0.0f,0.1f}},
-    {"stomach",           {0.6f,0.0f,0.3f,0.2f,0.0f,0.2f}},
-    {"breath",            {0.2f,0.3f,0.0f,0.0f,0.7f,0.1f}},
-    {"burning",           {0.3f,0.1f,0.9f,0.0f,0.0f,0.2f}},
-    {"floating",          {0.1f,0.4f,0.0f,0.5f,0.6f,0.3f}},
-    {"tingling",          {0.3f,0.3f,0.0f,0.0f,0.5f,0.4f}},
-    {"clenching",         {0.4f,0.0f,0.8f,0.0f,0.0f,0.1f}},
-    {"hollow",            {0.2f,0.0f,0.0f,0.9f,0.0f,0.3f}},
-    {"heaviness",         {0.3f,0.0f,0.2f,0.6f,0.0f,0.2f}},
-    {"lightness",         {0.0f,0.5f,0.0f,0.1f,0.8f,0.2f}},
-    {"nausea",            {0.7f,0.0f,0.3f,0.3f,0.0f,0.2f}},
-    {"shiver",            {0.7f,0.1f,0.1f,0.1f,0.0f,0.3f}},
-    {"ache",              {0.3f,0.2f,0.3f,0.4f,0.0f,0.2f}},
-    {"tightness",         {0.5f,0.0f,0.6f,0.1f,0.0f,0.2f}},
-    {"surge",             {0.2f,0.2f,0.5f,0.0f,0.7f,0.3f}},
-    {"numbness",          {0.1f,0.0f,0.0f,0.8f,0.0f,0.4f}},
-    {"pressure",          {0.4f,0.0f,0.5f,0.2f,0.0f,0.3f}},
-    {"flutter",           {0.4f,0.4f,0.0f,0.0f,0.5f,0.2f}},
-    {"grip",              {0.3f,0.0f,0.7f,0.0f,0.0f,0.2f}},
-    {"release",           {0.0f,0.5f,0.0f,0.2f,0.8f,0.1f}},
-    {"sweat",             {0.6f,0.0f,0.4f,0.0f,0.1f,0.2f}},
-    {"chill",             {0.5f,0.0f,0.1f,0.4f,0.0f,0.3f}},
-    {"throb",             {0.3f,0.1f,0.6f,0.0f,0.3f,0.2f}},
-    {"sinking",           {0.5f,0.0f,0.0f,0.7f,0.0f,0.3f}},
-    {"rush",              {0.2f,0.1f,0.4f,0.0f,0.8f,0.2f}},
-    {"knot",              {0.4f,0.0f,0.5f,0.3f,0.0f,0.3f}},
-    {"melting",           {0.0f,0.7f,0.0f,0.1f,0.6f,0.2f}},
-    {"tension",           {0.4f,0.0f,0.6f,0.1f,0.0f,0.3f}},
-    {"expansion",         {0.0f,0.4f,0.0f,0.0f,0.7f,0.5f}},
-    {"constriction",      {0.5f,0.0f,0.4f,0.3f,0.0f,0.4f}},
-    {"vibration",         {0.1f,0.2f,0.1f,0.0f,0.6f,0.5f}},
-};
-#define N_SOMATIC_SEEDS ((int)(sizeof(SOMATIC_SEEDS)/sizeof(SOMATIC_SEEDS[0])))
-
-static void somatic_feel(Chambers *c, const char *text){
-    char cur[32]={0}; int wi=0;
-    for(const char *p=text;;p++){
-        int ch=*p;
-        if(ch&&(isalpha((unsigned char)ch)||ch=='\'')){ if(wi<31) cur[wi++]=(char)tolower((unsigned char)ch); continue; }
-        if(wi>0){
-            cur[wi]=0;
-            for(int s=0;s<N_SOMATIC_SEEDS;s++){
-                if(strcmp(cur,SOMATIC_SEEDS[s].word)==0){
-                    for(int k=0;k<6;k++) c->act[k]+=0.12f*SOMATIC_SEEDS[s].aff[k];
-                    break;
-                }
-            }
-            wi=0;
-        }
-        if(!ch) break;
-    }
-    for(int i=0;i<6;i++) c->act[i]=clampf(c->act[i],0,1);
 }
 
 static float compute_dissonance(const MetaW *mw, const int *ids, int n, int V){
@@ -1005,7 +991,6 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         int uids[512]; int ulen=bpe_encode(bpe,(const uint8_t*)input_text,(int)strlen(input_text),uids,512);
         ingest_ids(mw,uids,ulen,0.02f);
         ch_feel_text(ch,input_text,pt);
-        somatic_feel(ch,input_text);
         somatic_diss=compute_dissonance(mw,uids,ulen,t->V);
         somatic_vel=auto_velocity(somatic_diss);
         ch->act[CH_FLOW]=clampf(ch->act[CH_FLOW]+0.1f,0,1);
@@ -1201,6 +1186,8 @@ int main(int argc, char **argv){
     Interference itf; interf_load(&itf,"docs",&bpe);
     if(itf.n_docs>0) printf("[4.5] Interference...\n  %d docs loaded\n",itf.n_docs);
 
+    Chambers ch; ch_init(&ch);
+
     /* try loading saved memory */
     {FILE *mf=fopen("q.memory","rb");
     if(mf){
@@ -1238,11 +1225,23 @@ int main(int argc, char **argv){
                 }
                 printf("  [periodic: %d elements loaded]\n",pt.n);
             }
+            {uint32_t soma_tag=0;
+            if(fread(&soma_tag,4,1,mf)==1&&soma_tag==QMEM_SOMA){
+                fread(ch.soma,sizeof(float),6,mf);
+                fread(&ch.presence,4,1,mf);
+                fread(&ch.debt,4,1,mf);
+                fread(&ch.trauma,4,1,mf);
+                for(int i=0;i<6;i++){
+                    ch.soma[i]=clampf(ch.soma[i],0,1);
+                    ch.act[i]=clampf(ch.act[i]>0.25f*ch.soma[i]?ch.act[i]:0.25f*ch.soma[i],0,1);
+                }
+                ch.presence=clampf(ch.presence,0,1);
+                ch.debt=clampf(ch.debt,0,1);
+                ch.trauma=clampf(ch.trauma,0,1);
+            }}
         }
         fclose(mf);
     }}
-
-    Chambers ch; ch_init(&ch);
 
     printf("[5] DOE Parliament...\n");
     Parliament parl; parl_init(&parl,t.D,4);
@@ -1279,6 +1278,12 @@ int main(int argc, char **argv){
             uint8_t chamber=(uint8_t)pt.elements[i].chamber;
             fwrite(&chamber,1,1,mf);fwrite(&pt.elements[i].mass,4,1,mf);
         }
+        {uint32_t soma_tag=QMEM_SOMA;
+        fwrite(&soma_tag,4,1,mf);
+        fwrite(ch.soma,sizeof(float),6,mf);
+        fwrite(&ch.presence,4,1,mf);
+        fwrite(&ch.debt,4,1,mf);
+        fwrite(&ch.trauma,4,1,mf);}
         fclose(mf);printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);
     }}
     printf("\nresonance is unbreakable.\n");

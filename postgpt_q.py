@@ -34,6 +34,7 @@ CHAIN_STEPS = 12
 TOP_K       = 15
 MAX_PERIODIC = 4096
 QPTQ_MAGIC  = 0x51505451
+QMEM_SOMA   = 0x414D4F53
 SPA_DIM     = 32
 SPA_NH      = 4
 SPA_HD      = SPA_DIM // SPA_NH
@@ -77,6 +78,36 @@ ANCHORS = {
     "paradox": CH_CMPLX, "contradiction": CH_CMPLX, "tension": CH_CMPLX,
     "chaos": CH_CMPLX, "mystery": CH_CMPLX, "transform": CH_CMPLX,
     "strange": CH_CMPLX, "ambiguity": CH_CMPLX, "uncertain": CH_CMPLX,
+}
+SOMATIC_SEEDS = {
+    "pulse":      [0.4, 0.0, 0.8, 0.0, 0.3, 0.2],
+    "tremor":     [0.8, 0.0, 0.2, 0.2, 0.0, 0.3],
+    "burning":    [0.3, 0.1, 0.9, 0.0, 0.1, 0.2],
+    "clenching":  [0.4, 0.0, 0.8, 0.1, 0.0, 0.3],
+    "tingling":   [0.5, 0.2, 0.1, 0.0, 0.4, 0.5],
+    "throbbing":  [0.3, 0.0, 0.7, 0.1, 0.3, 0.2],
+    "aching":     [0.2, 0.1, 0.2, 0.7, 0.0, 0.3],
+    "tightness":  [0.6, 0.0, 0.5, 0.3, 0.0, 0.3],
+    "sinking":    [0.5, 0.0, 0.0, 0.9, 0.0, 0.2],
+    "nausea":     [0.5, 0.0, 0.2, 0.7, 0.0, 0.3],
+    "heaviness":  [0.2, 0.0, 0.1, 0.8, 0.0, 0.2],
+    "weakness":   [0.5, 0.0, 0.0, 0.7, 0.0, 0.2],
+    "shaking":    [0.8, 0.0, 0.4, 0.1, 0.0, 0.3],
+    "freezing":   [0.7, 0.0, 0.0, 0.5, 0.0, 0.2],
+    "sweating":   [0.6, 0.0, 0.3, 0.1, 0.2, 0.2],
+    "warmth":     [0.0, 0.9, 0.0, 0.0, 0.6, 0.1],
+    "softness":   [0.0, 0.8, 0.0, 0.0, 0.5, 0.2],
+    "floating":   [0.0, 0.3, 0.0, 0.2, 0.8, 0.3],
+    "pressure":   [0.4, 0.0, 0.5, 0.5, 0.0, 0.4],
+    "vibrating":  [0.2, 0.1, 0.3, 0.0, 0.4, 0.8],
+    "chest":      [0.4, 0.5, 0.4, 0.3, 0.2, 0.3],
+    "throat":     [0.6, 0.2, 0.3, 0.5, 0.0, 0.3],
+    "stomach":    [0.5, 0.1, 0.3, 0.6, 0.1, 0.3],
+    "jaw":        [0.2, 0.0, 0.9, 0.1, 0.0, 0.2],
+    "fists":      [0.1, 0.0, 0.9, 0.0, 0.0, 0.2],
+    "spine":      [0.7, 0.0, 0.2, 0.2, 0.1, 0.4],
+    "temples":    [0.4, 0.0, 0.3, 0.3, 0.0, 0.6],
+    "shoulders":  [0.3, 0.0, 0.4, 0.4, 0.0, 0.3],
 }
 def extract_words(text):
     return re.findall(r"[a-z']+", text.lower())
@@ -431,7 +462,7 @@ def ingest_ids(mw, ids, amount=0.02):
             if not found and mw.n_hebb < MAX_HEBBIAN:
                 mw.hebbs.append([a, b, decay * max(0.01, amount)])
                 mw.n_hebb += 1
-def load_memory(mw, path, periodic=None):
+def load_memory(mw, path, periodic=None, chambers=None):
     if not os.path.exists(path):
         return False
     try:
@@ -487,10 +518,24 @@ def load_memory(mw, path, periodic=None):
                         print("  [periodic: %d elements loaded]" % len(periodic.elements))
             except Exception:
                 pass  # no periodic data in older memory files
+            try:
+                soma_tag = mf.read(4)
+                if len(soma_tag) == 4 and chambers is not None:
+                    if struct.unpack("<I", soma_tag)[0] == QMEM_SOMA:
+                        soma_vals = struct.unpack("<6f", mf.read(24))
+                        presence, debt, trauma = struct.unpack("<3f", mf.read(12))
+                        chambers.soma = [clampf(v, 0.0, 1.0) for v in soma_vals]
+                        chambers.presence = clampf(presence, 0.0, 1.0)
+                        chambers.debt = clampf(max(chambers.debt, debt), 0.0, 1.0)
+                        chambers.trauma = clampf(max(chambers.trauma, trauma), 0.0, 1.0)
+                        for i in range(N_CHAMBERS):
+                            chambers.act[i] = clampf(max(chambers.act[i], 0.25 * chambers.soma[i]), 0.0, 1.0)
+            except Exception:
+                pass
         return True
     except Exception:
         return False
-def save_memory(mw, path, periodic=None):
+def save_memory(mw, path, periodic=None, chambers=None):
     with open(path, "wb") as mf:
         mf.write(struct.pack("<I", 0x514D454D))
         mf.write(struct.pack("<3i", mw.n_bi, mw.n_tri, mw.n_hebb))
@@ -512,14 +557,22 @@ def save_memory(mw, path, periodic=None):
                 mf.write(struct.pack("<f", elem["mass"]))
         else:
             mf.write(struct.pack("<I", 0))
+        if chambers is not None:
+            mf.write(struct.pack("<I", QMEM_SOMA))
+            mf.write(struct.pack("<6f", *[clampf(v, 0.0, 1.0) for v in chambers.soma]))
+            mf.write(struct.pack("<3f", clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0)))
 # ── Chambers ──
 class Chambers:
     def __init__(self):
         self.act = [0.0] * 6
+        self.soma = [0.0] * 6
         self.debt = 0.0
         self.trauma = 0.0
+        self.presence = 0.0
 
     def feel(self, text, periodic=None):
+        soma_hits = 0
+        soma_mix = [0.0] * 6
         for word in extract_words(text):
             anchor = ANCHORS.get(word)
             if anchor is not None:
@@ -528,6 +581,27 @@ class Chambers:
                 el = periodic.classify(word)
                 if el is not None:
                     self.act[el["ch"]] += 0.08 * el["mass"]
+            seed = SOMATIC_SEEDS.get(word)
+            if seed is not None:
+                soma_hits += 1
+                for i in range(N_CHAMBERS):
+                    soma_mix[i] += seed[i]
+        if soma_hits > 0:
+            inv = 1.0 / soma_hits
+            for i in range(N_CHAMBERS):
+                avg = soma_mix[i] * inv
+                self.soma[i] = clampf(0.82 * self.soma[i] + 0.18 * avg, 0.0, 1.0)
+                self.act[i] += 0.06 * avg
+            intensity = clampf(sum(soma_mix) * inv / 2.4, 0.0, 1.0)
+            self.presence = clampf(0.86 * self.presence + 0.14 * intensity, 0.0, 1.0)
+        else:
+            for i in range(N_CHAMBERS):
+                self.soma[i] *= 0.98
+            self.presence *= 0.99
+        somatic_trauma = 0.45 * self.soma[CH_FEAR] + 0.35 * self.soma[CH_RAGE] + 0.20 * self.soma[CH_VOID]
+        somatic_debt = 0.35 * self.soma[CH_CMPLX] + 0.25 * self.soma[CH_FLOW] + 0.20 * self.presence
+        self.trauma = clampf(0.92 * self.trauma + 0.08 * somatic_trauma, 0.0, 1.0)
+        self.debt = clampf(0.96 * self.debt + 0.04 * somatic_debt, 0.0, 1.0)
         for i in range(N_CHAMBERS):
             self.act[i] = clampf(self.act[i], 0.0, 1.0)
 
@@ -542,6 +616,14 @@ class Chambers:
         b = clampf(1.0 + 0.4 * self.act[CH_FLOW] - 0.2 * self.act[CH_FEAR], 0.3, 2.0)
         g = clampf(1.0 + 0.5 * self.act[CH_CMPLX] + 0.2 * self.act[CH_LOVE] - 0.1 * self.act[CH_VOID], 0.3, 2.0)
         t = clampf(1.0 - 0.2 * self.act[CH_FLOW] + 0.1 * self.act[CH_FEAR], 0.3, 2.0)
+        a *= clampf(1.0 + 0.14 * self.soma[CH_LOVE] + 0.08 * self.soma[CH_FLOW] + 0.05 * self.presence, 0.7, 1.5)
+        b *= clampf(1.0 + 0.10 * self.soma[CH_FLOW] + 0.08 * self.soma[CH_CMPLX] + 0.04 * self.presence, 0.7, 1.5)
+        g *= clampf(1.0 + 0.10 * self.soma[CH_CMPLX] + 0.05 * self.soma[CH_VOID] + 0.06 * self.presence, 0.7, 1.5)
+        t *= clampf(1.0 - 0.10 * self.soma[CH_FLOW] + 0.08 * self.soma[CH_FEAR] + 0.06 * self.soma[CH_RAGE], 0.7, 1.5)
+        a = clampf(a, 0.3, 2.0)
+        b = clampf(b, 0.3, 2.0)
+        g = clampf(g, 0.3, 2.0)
+        t = clampf(t, 0.3, 2.0)
         return a, b, g, t
 
     def summary(self):
@@ -549,13 +631,17 @@ class Chambers:
         for i in range(N_CHAMBERS):
             if self.act[i] > 0.05:
                 parts.append("%s:%.0f%%" % (CH_N[i], self.act[i] * 100.0))
+        if self.presence > 0.05:
+            parts.append("SOMA:%.0f%%" % (self.presence * 100.0))
         return " ".join(parts) if parts else "quiet"
 def ch_init(c):
     c.act = [0.0] * 6
+    c.soma = [0.0] * 6
     c.act[CH_LOVE] = 0.2
     c.act[CH_FLOW] = 0.15
     c.debt = 0.0
     c.trauma = 0.0
+    c.presence = 0.0
 def ch_xfire(c, it):
     for _ in range(it):
         old = list(c.act)
@@ -565,53 +651,9 @@ def ch_xfire(c, it):
                 if i != j:
                     c.act[i] += 0.03 * COU[i][j] * math.sin(old[j] - old[i])
             c.act[i] = clampf(c.act[i], 0.0, 1.0)
-# ── Somatic Sonar (micro-Klaus) ──
-#              word          FEAR  LOVE  RAGE  VOID  FLOW  CMPLX
-SOMATIC_SEEDS = {
-    "pulse":        (0.4, 0.0, 0.8, 0.0, 0.3, 0.2),
-    "warmth":       (0.0, 0.9, 0.0, 0.0, 0.6, 0.1),
-    "tremor":       (0.8, 0.0, 0.2, 0.2, 0.0, 0.3),
-    "chest":        (0.3, 0.5, 0.2, 0.0, 0.1, 0.1),
-    "jaw":          (0.2, 0.0, 0.7, 0.0, 0.0, 0.1),
-    "stomach":      (0.6, 0.0, 0.3, 0.2, 0.0, 0.2),
-    "breath":       (0.2, 0.3, 0.0, 0.0, 0.7, 0.1),
-    "burning":      (0.3, 0.1, 0.9, 0.0, 0.0, 0.2),
-    "floating":     (0.1, 0.4, 0.0, 0.5, 0.6, 0.3),
-    "tingling":     (0.3, 0.3, 0.0, 0.0, 0.5, 0.4),
-    "clenching":    (0.4, 0.0, 0.8, 0.0, 0.0, 0.1),
-    "hollow":       (0.2, 0.0, 0.0, 0.9, 0.0, 0.3),
-    "heaviness":    (0.3, 0.0, 0.2, 0.6, 0.0, 0.2),
-    "lightness":    (0.0, 0.5, 0.0, 0.1, 0.8, 0.2),
-    "nausea":       (0.7, 0.0, 0.3, 0.3, 0.0, 0.2),
-    "shiver":       (0.7, 0.1, 0.1, 0.1, 0.0, 0.3),
-    "ache":         (0.3, 0.2, 0.3, 0.4, 0.0, 0.2),
-    "tightness":    (0.5, 0.0, 0.6, 0.1, 0.0, 0.2),
-    "surge":        (0.2, 0.2, 0.5, 0.0, 0.7, 0.3),
-    "numbness":     (0.1, 0.0, 0.0, 0.8, 0.0, 0.4),
-    "pressure":     (0.4, 0.0, 0.5, 0.2, 0.0, 0.3),
-    "flutter":      (0.4, 0.4, 0.0, 0.0, 0.5, 0.2),
-    "grip":         (0.3, 0.0, 0.7, 0.0, 0.0, 0.2),
-    "release":      (0.0, 0.5, 0.0, 0.2, 0.8, 0.1),
-    "sweat":        (0.6, 0.0, 0.4, 0.0, 0.1, 0.2),
-    "chill":        (0.5, 0.0, 0.1, 0.4, 0.0, 0.3),
-    "throb":        (0.3, 0.1, 0.6, 0.0, 0.3, 0.2),
-    "sinking":      (0.5, 0.0, 0.0, 0.7, 0.0, 0.3),
-    "rush":         (0.2, 0.1, 0.4, 0.0, 0.8, 0.2),
-    "knot":         (0.4, 0.0, 0.5, 0.3, 0.0, 0.3),
-    "melting":      (0.0, 0.7, 0.0, 0.1, 0.6, 0.2),
-    "tension":      (0.4, 0.0, 0.6, 0.1, 0.0, 0.3),
-    "expansion":    (0.0, 0.4, 0.0, 0.0, 0.7, 0.5),
-    "constriction": (0.5, 0.0, 0.4, 0.3, 0.0, 0.4),
-    "vibration":    (0.1, 0.2, 0.1, 0.0, 0.6, 0.5),
-}
-def somatic_feel(c, text):
-    for word in extract_words(text):
-        aff = SOMATIC_SEEDS.get(word)
-        if aff is not None:
-            for k in range(6):
-                c.act[k] += 0.12 * aff[k]
-    for i in range(6):
-        c.act[i] = clampf(c.act[i], 0.0, 1.0)
+            c.soma[i] = clampf(0.94 * c.soma[i] + 0.02 * c.act[i], 0.0, 1.0)
+        c.presence = clampf(0.95 * c.presence + 0.03 * c.emergence(), 0.0, 1.0)
+# ── Dissonance & Velocity (micro-Klaus sonar) ──
 def compute_dissonance(mw, ids, V):
     n = len(ids)
     if n <= 1:
@@ -1403,7 +1445,6 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         uids = bpe_encode(bpe, inp_bytes, len(inp_bytes), 512)
         ingest_ids(mw, uids)
         ch.feel(input_text, periodic)
-        somatic_feel(ch, input_text)
         somatic_diss = compute_dissonance(mw, uids, t.V)
         somatic_vel = auto_velocity(somatic_diss)
         ch.act[CH_FLOW] = clampf(ch.act[CH_FLOW] + 0.1, 0.0, 1.0)
@@ -1682,7 +1723,7 @@ def main():
         t.clen = 0
         t.logits = [0.0] * t.V
 
-    if load_memory(mw, "q.memory", periodic):
+    if load_memory(mw, "q.memory", periodic, ch):
         print("  [memory loaded: %d bi, %d tri, %d hebb from q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb))
 
     interference = Interference()
@@ -1726,7 +1767,7 @@ def main():
 
     # save memory
     try:
-        save_memory(mw, "q.memory", periodic)
+        save_memory(mw, "q.memory", periodic, ch)
         print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
     except Exception:
         pass
