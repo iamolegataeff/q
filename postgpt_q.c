@@ -351,7 +351,7 @@ static const DarkMatterWord DARK_MATTER_WORDS[]={
 };
 typedef struct{char word[32]; int chamber; float mass;}PeriodicElement;
 typedef struct{PeriodicElement elements[MAX_PERIODIC]; int n;}PeriodicTable;
-typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;float scar;}Chambers;
+typedef struct{float act[6];float soma[6];float debt;float trauma;float presence;float scar;float coherence;float phase_lock;float threshold_bias;}Chambers;
 typedef struct{
     int mode; float temp_mul,heb_mul,pro_mul,ds_mul,bg_mul,tg_mul;
     float interf_bonus,wormhole_bonus,debt_decay,trauma_decay,scar_decay,dark_pressure;
@@ -372,7 +372,8 @@ typedef struct{
 }ExperienceLog;
 static ExperienceLog QEXP={0};
 
-static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0;}
+static float ch_emergence(const Chambers *c);
+static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;c->trauma=0; c->coherence=0; c->phase_lock=0; c->threshold_bias=0;}
 static void ch_xfire(Chambers *c, int it){
     for(int t=0;t<it;t++){float old[6];memcpy(old,c->act,sizeof(old));
         for(int i=0;i<6;i++){c->act[i]*=CH_D[i];
@@ -392,6 +393,25 @@ static void janus_phase_pressure(Chambers *c, int step_idx, int total_steps){
     else if(d<0.66f) c->act[CH_FEAR]=clampf(c->act[CH_FEAR]+0.04f,0,1);
     else c->act[CH_VOID]=clampf(c->act[CH_VOID]+0.05f,0,1);
     if(d>0.75f) c->act[CH_CMPLX]=clampf(c->act[CH_CMPLX]+0.03f,0,1);
+}
+static float coherence_env_pressure(const Chambers *c, float dissonance, float prophecy_debt, float chunk_res){
+    return clampf(0.34f*dissonance + 0.26f*prophecy_debt + 0.18f*chunk_res + 0.10f*c->act[CH_CMPLX] + 0.08f*c->scar,0,1);
+}
+static float soft_phase_gate(const Chambers *c, float env_pressure){
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    float signal=clampf(0.50f*c->coherence + 0.34f*c->phase_lock + 0.12f*env_pressure + 0.06f*c->presence - 0.08f*c->trauma,0,1);
+    return clampf(0.5f + 1.35f*(signal-threshold),0,1);
+}
+static float update_phase_state(Chambers *c, float local_coherence, float env_pressure){
+    local_coherence=clampf(local_coherence,0,1);
+    env_pressure=clampf(env_pressure,0,1);
+    c->coherence=clampf(0.84f*c->coherence + 0.16f*local_coherence,0,1);
+    float target=clampf(0.52f*c->coherence + 0.18f*c->presence + 0.16f*ch_emergence(c) + 0.14f*env_pressure - 0.08f*c->scar,0,1);
+    float threshold=clampf(0.42f + 0.18f*c->threshold_bias + 0.06f*c->scar,0.25f,0.88f);
+    if(target>=threshold) c->phase_lock=clampf(0.88f*c->phase_lock + 0.12f*target + 0.05f*(target-threshold),0,1);
+    else c->phase_lock=clampf(0.975f*c->phase_lock + 0.025f*target,0,1);
+    c->threshold_bias=clampf(0.93f*c->threshold_bias + 0.07f*env_pressure,0,1);
+    return soft_phase_gate(c,env_pressure);
 }
 static void qexp_add_scar(int step, float scar, const char *note){
     if(QEXP.n_scars>=128) return;
@@ -446,6 +466,29 @@ static void consolidate_experience(MetaW *mw, PeriodicTable *pt, Chambers *ch){
     if(QEXP.n_scars>0) ch->scar=clampf(ch->scar>(0.40f*scar_avg)?ch->scar:(0.40f*scar_avg),0,1);
     {float prop_boost=clampf(0.05f+0.18f*prop_avg+0.02f*chunk_avg+0.08f*worm_success-0.04f*scar_avg,0,0.28f);
     for(int i=0;i<mw->n_prophecy&&i<8;i++){ mw->prophecies[i].strength=clampf(mw->prophecies[i].strength+prop_boost,0,1); if(mw->prophecies[i].age<1) mw->prophecies[i].age=1; }}
+    if(mw->n_prophecy>=2){
+        float pair_strength=clampf(0.02f+0.06f*prop_avg+0.01f*chunk_avg+0.05f*worm_success,0,0.18f);
+        int top[4], topn=mw->n_prophecy<4?mw->n_prophecy:4;
+        for(int i=0;i<topn;i++) top[i]=mw->prophecies[i].target;
+        for(int i=0;i<topn;i++) for(int j=i+1;j<topn;j++){
+            int a=top[i]<top[j]?top[i]:top[j], b=top[i]<top[j]?top[j]:top[i], found=0;
+            for(int k=0;k<mw->n_hebb;k++) if(mw->hebbs[k].a==a&&mw->hebbs[k].b==b){ mw->hebbs[k].str+=pair_strength; found=1; break; }
+            if(!found&&mw->n_hebb<MAX_HEBBIAN){ mw->hebbs[mw->n_hebb].a=a; mw->hebbs[mw->n_hebb].b=b; mw->hebbs[mw->n_hebb].str=pair_strength; mw->n_hebb++; }
+        }
+    }
+    if(pt->n>0){
+        float reinforce=clampf(0.02f+0.012f*chunk_avg+0.05f*worm_success+0.04f*prop_avg-0.02f*scar_avg,0,0.18f);
+        int dom=0; for(int i=1;i<6;i++) if(ch->act[i]>ch->act[dom]) dom=i;
+        for(int pass=0;pass<2;pass++){
+            int touched=0;
+            for(int i=0;i<pt->n&&touched<8;i++){
+                int match = (pt->elements[i].chamber==dom);
+                if((pass==0 && match) || (pass==1 && !match)) continue;
+                pt->elements[i].mass=clampf(pt->elements[i].mass+reinforce*(match?1.0f:0.65f),0,1);
+                touched++;
+            }
+        }
+    }
 }
 static int periodic_find(const PeriodicTable *pt, const char *word){
     for(int i=0;i<pt->n;i++) if(strcmp(pt->elements[i].word,word)==0) return i;
@@ -523,8 +566,6 @@ static void ch_feel_text(Chambers *c, const char *text, const PeriodicTable *pt)
     c->debt=clampf(0.96f*c->debt+0.04f*(0.35f*c->soma[CH_CMPLX]+0.25f*c->soma[CH_FLOW]+0.20f*c->presence),0,1);
     for(int i=0;i<6;i++) c->act[i]=clampf(c->act[i],0,1);
 }
-static int ch_dominant(const Chambers *c){int dom=0;for(int i=1;i<6;i++) if(c->act[i]>c->act[dom]) dom=i;return dom;}
-static float ch_emergence(const Chambers *c){float v=c->act[CH_VOID]>0.10f?c->act[CH_VOID]:0.10f; float f=c->act[CH_FLOW]<0.95f?c->act[CH_FLOW]:0.95f; return (1.0f-v)*f;}
 static float ch_absorb_dark_matter(Chambers *c, const char *text, const PeriodicTable *pt){
     char cur[32]={0}; int wi=0,hits=0; float score=0;
     for(const char *p=text;;p++){
@@ -548,6 +589,8 @@ static float ch_absorb_dark_matter(Chambers *c, const char *text, const Periodic
     c->presence=clampf(c->presence*(1.0f-0.08f*c->scar),0,1);
     return c->scar;
 }
+static int ch_dominant(const Chambers *c){int dom=0;for(int i=1;i<6;i++) if(c->act[i]>c->act[dom]) dom=i;return dom;}
+static float ch_emergence(const Chambers *c){float v=c->act[CH_VOID]>0.10f?c->act[CH_VOID]:0.10f; float f=c->act[CH_FLOW]<0.95f?c->act[CH_FLOW]:0.95f; return (1.0f-v)*f;}
 static void ch_modulate(const Chambers *c, float *a, float *b, float *g, float *t){
     *a=clampf(1.0f+0.4f*c->act[CH_LOVE]-0.2f*c->act[CH_RAGE]+0.3f*c->act[CH_FLOW],0.3f,2.0f);
     *b=clampf(1.0f+0.4f*c->act[CH_FLOW]-0.2f*c->act[CH_FEAR],0.3f,2.0f);
@@ -563,6 +606,7 @@ static void ch_summary(const Chambers *c, char *buf, int sz){
     for(int i=0;i<6;i++) if(c->act[i]>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%s%s:%.0f%%",pos?" ":"",CH_N[i],c->act[i]*100.0f);if(w>0&&pos+w<sz)pos+=w;else break;}
     if(c->presence>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSOMA:%.0f%%",pos?" ":"",c->presence*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(c->scar>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sSCAR:%.0f%%",pos?" ":"",c->scar*100.0f);if(w>0&&pos+w<sz)pos+=w;}
+    if(c->phase_lock>0.05f&&pos<sz-1){int w=snprintf(buf+pos,sz-pos,"%sPHASE:%.0f%%",pos?" ":"",c->phase_lock*100.0f);if(w>0&&pos+w<sz)pos+=w;}
     if(pos==0) snprintf(buf,sz,"quiet");
 }
 static VelocityProfile velocity_profile(const Chambers *c, float dissonance){
