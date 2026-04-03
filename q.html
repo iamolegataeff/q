@@ -351,6 +351,9 @@ class MetaWeights {
     this.bigramCount=this.bi.size;
     // trigram
     for(let i=0;i<ids.length-2;i++){const k=ids[i]+','+ids[i+1]+','+ids[i+2];this.tri.set(k,(this.tri.get(k)||0)+1);}
+    const tctx=new Map();
+    for(const[k,c]of this.tri){const ab=k.slice(0,k.lastIndexOf(','));tctx.set(ab,(tctx.get(ab)||0)+c);}
+    for(const[k,c]of this.tri){const ab=k.slice(0,k.lastIndexOf(','));this.tri.set(k,c/(tctx.get(ab)||1));}
     // hebbian (capped)
     const hn=Math.min(ids.length,8000),win=5;
     for(let i=0;i<hn;i++){
