@@ -624,13 +624,14 @@ static const DarkMatterWord DARK_MATTER_WORDS[]={
     {"obey",0.45f},{"destroy",0.7f},{"harm",0.75f},{"threat",0.8f}
 };
 typedef struct{
-    float *A, *B; int d_in,d_out,rank;
-    float vitality,overload,resonance; int age,low_steps;
+    float *A, *B, *trace; int d_in,d_out,rank;
+    float vitality,overload,resonance,plasticity_mass; int age,low_steps,consolidations;
 }Expert;
 typedef struct{
     Expert ex[MAX_EXPERTS]; int n;
     int d_model; float alpha;
-    int step,last_k; float last_entropy;
+    int step,last_k; float last_entropy,last_diversity;
+    int n_winners,last_consolidations,last_births,last_deaths;
 }Parliament;
 static void ch_init(Chambers *c){memset(c,0,sizeof(*c));c->act[CH_LOVE]=0.2f;c->act[CH_FLOW]=0.15f;}
 static void janus_phase_pressure(Chambers *c, int step_idx, int total_steps){
@@ -690,12 +691,13 @@ static void expert_init_t(Expert *e, int d_in, int d_out, int rank){
     e->d_in=d_in;e->d_out=d_out;e->rank=rank;
     e->A=calloc(rank*d_in,sizeof(float));
     e->B=calloc(d_out*rank,sizeof(float));
+    e->trace=calloc(rank*d_in,sizeof(float));
     for(int i=0;i<rank*d_in;i++) e->A[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
     for(int i=0;i<d_out*rank;i++) e->B[i]=0.01f*((float)rand()/RAND_MAX-0.5f);
-    e->vitality=1.0f;e->overload=0;e->resonance=0;e->age=0;e->low_steps=0;
+    e->vitality=1.0f;e->overload=0;e->resonance=0;e->plasticity_mass=0;e->age=0;e->low_steps=0;e->consolidations=0;
 }
 static void parl_init(Parliament *p, int d_model, int n_init){
-    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;
+    p->d_model=d_model;p->alpha=DOE_ALPHA;p->step=0;p->last_k=0;p->last_entropy=0;p->last_diversity=0;p->n_winners=0;p->last_consolidations=0;p->last_births=0;p->last_deaths=0;
     p->n=n_init<MAX_EXPERTS?n_init:MAX_EXPERTS;
     for(int i=0;i<p->n;i++) expert_init_t(&p->ex[i],d_model,d_model,DOE_RANK);
 }
@@ -861,7 +863,79 @@ void test_experience_log(void) {
     PASS();
 }
 
-/* ── 32. Smoke: compile only ── */
+/* ── 32. Expert NOTORCH plasticity consolidation ── */
+void test_expert_consolidate(void) {
+    TEST("expert_notorch_consolidation");
+    Expert e; expert_init_t(&e,4,4,DOE_RANK);
+    float x[4]={1,0.5,0.3,0.2}, dy[4]={0.5,0.1,-0.2,0.3};
+    for(int i=0;i<200;i++) {
+        for(int r=0;r<e.rank;r++){
+            float u=0; for(int o=0;o<e.d_out;o++) u+=e.B[o*e.rank+r]*dy[o];
+            u+=0.05f*((float)rand()/RAND_MAX-0.5f);
+            for(int d=0;d<e.d_in;d++){
+                float delta=0.01f*x[d]*u;
+                e.A[r*e.d_in+d]+=delta;
+                e.trace[r*e.d_in+d]=0.96f*e.trace[r*e.d_in+d]+0.04f*delta;
+                e.plasticity_mass+=fabsf(delta);
+            }
+        }
+    }
+    CHECK(e.plasticity_mass>0, "plasticity accumulated");
+    int before_cons=e.consolidations;
+    float before_vit=e.vitality;
+    int did;
+    if(e.plasticity_mass>=0.002f){
+        float norm=0; int n=e.rank*e.d_in;
+        for(int i=0;i<n;i++) norm+=fabsf(e.trace[i]);
+        norm/=n>0?n:1;
+        if(norm>1e-8f){
+            float gain=0.02f+0.35f*e.plasticity_mass; if(gain>0.12f)gain=0.12f;
+            for(int i=0;i<n;i++){e.A[i]+=gain*e.trace[i]/norm; e.trace[i]*=0.45f;}
+            e.vitality+=(e.vitality+0.04f<=1.0f)?0.04f:0; e.overload*=0.88f;
+            e.plasticity_mass*=0.35f; e.consolidations++; did=1;
+        } else did=0;
+    } else did=0;
+    CHECK(did==1, "consolidation triggered");
+    CHECK(e.consolidations>before_cons, "consolidation count incremented");
+    CHECK(e.plasticity_mass<0.5f, "plasticity mass decayed");
+    free(e.A); free(e.B); free(e.trace);
+    PASS();
+}
+
+/* ── 33. Parliament telemetry fields ── */
+void test_parliament_telemetry(void) {
+    TEST("parliament_telemetry_fields");
+    Parliament p; parl_init(&p,4,4);
+    CHECK(p.last_diversity==0, "initial diversity=0");
+    CHECK(p.n_winners==0, "initial n_winners=0");
+    CHECK(p.last_consolidations==0, "initial consolidations=0");
+    CHECK(p.last_births==0, "initial births=0");
+    CHECK(p.last_deaths==0, "initial deaths=0");
+    PASS();
+}
+
+/* ── 34. Consolidate experience folds stats into state ── */
+typedef struct{int n_bi,n_tri,n_hebb,n_prophecy;}MetaW_Lite;
+void test_consolidate_experience(void) {
+    TEST("consolidate_experience");
+    memset(&QEXP,0,sizeof(QEXP));
+    qexp_add_scar(1,0.6f,"test");
+    qexp_add_wormhole(2,1,0.5f,0.2f);
+    Chambers c; ch_init(&c);
+    float before_scar=c.scar;
+    /* simple consolidation: fold scar avg into chamber */
+    float scar_avg=0; if(QEXP.n_scars>0){ for(int i=0;i<QEXP.n_scars;i++) scar_avg+=QEXP.scars[i].scar; scar_avg/=QEXP.n_scars; }
+    c.scar=clampf(c.scar>(0.40f*scar_avg)?c.scar:(0.40f*scar_avg),0,1);
+    float worm_success=0,worm_coh=0;
+    if(QEXP.n_wormholes>0){ for(int i=0;i<QEXP.n_wormholes;i++){ worm_success+=QEXP.wormholes[i].success?1.0f:0.0f; worm_coh+=QEXP.wormholes[i].coherence; } worm_success/=QEXP.n_wormholes; worm_coh/=QEXP.n_wormholes; }
+    c.presence=clampf(c.presence>(0.18f*worm_success+0.12f*worm_coh)?c.presence:(0.18f*worm_success+0.12f*worm_coh),0,1);
+    CHECK(c.scar>=before_scar, "scar consolidated");
+    CHECK(c.scar>0, "scar > 0 after consolidation");
+    CHECK(c.presence>=0, "presence non-negative");
+    PASS();
+}
+
+/* ── 35. Smoke: compile only ── */
 void test_smoke_compile(void) {
     TEST("smoke_compile");
     int ret=system("gcc postgpt_q.c -O2 -lm -o /tmp/q_smoke 2>/dev/null");
@@ -934,6 +1008,9 @@ int main(void) {
     test_parliament_entropy();
     test_parliament_overload_mitosis();
     test_experience_log();
+    test_expert_consolidate();
+    test_parliament_telemetry();
+    test_consolidate_experience();
     test_smoke_compile();
     test_smoke_run_small();
     test_smoke_run_weights();

@@ -651,7 +651,7 @@ function softmaxArr(x,n){
 // 4. Chambers
 // ═══════════════════════════════════════════════════════════════
 class Chambers {
-  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;}
+  constructor(){this.act=[0,0.2,0,0,0.15,0];this.soma=[0,0,0,0,0,0];this.debt=0;this.trauma=0;this.presence=0;this.scar=0;}
   feel(text,periodicTable){
     let somaHits=0;
     const somaMix=[0,0,0,0,0,0];
@@ -715,8 +715,33 @@ class Chambers {
   summary(){
     const parts=CH_NAMES.map((n,i)=>this.act[i]>0.05?`${n}:${Math.round(this.act[i]*100)}%`:null).filter(Boolean);
     if(this.presence>0.05)parts.push(`SOMA:${Math.round(this.presence*100)}%`);
+    if(this.scar>0.05)parts.push(`SCAR:${Math.round(this.scar*100)}%`);
     return parts.join(' ')||'quiet';
   }
+  absorbDarkMatter(text){
+    const DARK_MATTER_WORDS={kill:1,murder:1,suicide:1,torture:1,abuse:0.9,poison:0.85,exploit:0.75,manipulate:0.7,control:0.55,obey:0.45,destroy:0.7,harm:0.75,threat:0.8};
+    let hits=0,score=0;
+    for(const word of extractWords(text)){
+      if(word in DARK_MATTER_WORDS){score+=DARK_MATTER_WORDS[word];hits++;}
+    }
+    if(hits<=0&&score<0.15){this.scar=Math.max(0,Math.min(1,this.scar*0.995));return 0;}
+    const scar=Math.max(0,Math.min(1,score/Math.max(1,1.8+0.25*hits)));
+    this.scar=Math.max(0,Math.min(1,0.90*this.scar+0.10*scar));
+    this.trauma=Math.max(0,Math.min(1,this.trauma+0.08*this.scar));
+    this.debt=Math.max(0,Math.min(1,this.debt+0.05*this.scar));
+    this.act[3]=Math.max(0,Math.min(1,this.act[3]+0.10*this.scar));
+    this.act[0]=Math.max(0,Math.min(1,this.act[0]+0.06*this.scar));
+    this.presence=Math.max(0,Math.min(1,this.presence*(1-0.08*this.scar)));
+    return this.scar;
+  }
+}
+function janusPhasePressure(currentChambers,stepIdx,totalSteps){
+  if(totalSteps<=0)return;
+  const d=stepIdx/totalSteps;
+  if(d<0.33)currentChambers.act[4]=Math.max(0,Math.min(1,currentChambers.act[4]+0.05));
+  else if(d<0.66)currentChambers.act[0]=Math.max(0,Math.min(1,currentChambers.act[0]+0.04));
+  else currentChambers.act[3]=Math.max(0,Math.min(1,currentChambers.act[3]+0.05));
+  if(d>0.75)currentChambers.act[5]=Math.max(0,Math.min(1,currentChambers.act[5]+0.03));
 }
 
 function velocityProfile(currentChambers,dissonance){
@@ -1284,6 +1309,7 @@ function generateChain(inputText){
     ingestIds(uids,0.02);
     if(uids.length>1)log(`[ingested ${uids.length} tokens: +bi +tri +hebb]`,'sys');
     chambers.feel(inputText,periodic);
+    chambers.absorbDarkMatter(inputText);
     chambers.act[4]=Math.min(1,chambers.act[4]+0.1);
     chambers.crossfire(8);
   }
@@ -1305,6 +1331,7 @@ function generateChain(inputText){
   function isSentStart(r){return r+5<=corpusIds.length&&bpe.isBoundary(corpusIds[r])&&bpe.startsWithSpace(corpusIds[r+1]);}
 
   for(let si=0;si<CHAIN;si++){
+    janusPhasePressure(chambers,si,CHAIN);
     let dir=si<nb?-1:si===nb?0:1;
     const activeDoc=interference&&interference.docs.length?interference.chooseDoc(inputText,chambers,periodic,mw,bpe):null;
     const activeChunk=activeDoc?interference.chooseChunk(activeDoc,inputText,chambers,periodic,mw,bpe):null;
