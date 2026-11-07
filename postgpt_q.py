@@ -253,6 +253,12 @@ def bpe_decode_token(bpe, tid):
         return b.decode("utf-8", errors="replace")
     except Exception:
         return b.decode("latin-1")
+def bpe_find_token(bpe, word):
+    wb = word.encode("utf-8")
+    for i in range(bpe.vocab_size):
+        if bpe.vocab_bytes.get(i, b"") == wb:
+            return i
+    return -1
 # ── MetaWeights ──
 class MetaW:
     def __init__(self):
@@ -594,19 +600,30 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
         conn = sqlite3.connect(path)
         sqlite_init(conn)
         cur = conn.cursor()
+        # merge into the corpus-built field: one entry per key, the stronger value wins
+        idx = {tuple(item[:2]): item for item in mw.bigrams}
         for a, b, p in cur.execute("SELECT a,b,prob FROM bigrams"):
-            ingest_ids(mw, [a, b], 0.0)
-            for item in mw.bigrams:
-                if item[0] == a and item[1] == b:
-                    item[2] = max(item[2], p)
-                    break
+            if (a, b) in idx:
+                idx[(a, b)][2] = max(idx[(a, b)][2], p)
+            elif mw.n_bi < MAX_BIGRAM:
+                idx[(a, b)] = [a, b, p]
+                mw.bigrams.append(idx[(a, b)])
+                mw.n_bi += 1
+        idx = {tuple(item[:3]): item for item in mw.trigrams}
         for a, b, c, p in cur.execute("SELECT a,b,c,prob FROM trigrams"):
-            if mw.n_tri < MAX_TRIGRAM:
-                mw.trigrams.append([a, b, c, p])
+            if (a, b, c) in idx:
+                idx[(a, b, c)][3] = max(idx[(a, b, c)][3], p)
+            elif mw.n_tri < MAX_TRIGRAM:
+                idx[(a, b, c)] = [a, b, c, p]
+                mw.trigrams.append(idx[(a, b, c)])
                 mw.n_tri += 1
+        idx = {tuple(item[:2]): item for item in mw.hebbs}
         for a, b, p in cur.execute("SELECT a,b,strength FROM hebb"):
-            if mw.n_hebb < MAX_HEBBIAN:
-                mw.hebbs.append([a, b, p])
+            if (a, b) in idx:
+                idx[(a, b)][2] = max(idx[(a, b)][2], p)
+            elif mw.n_hebb < MAX_HEBBIAN:
+                idx[(a, b)] = [a, b, p]
+                mw.hebbs.append(idx[(a, b)])
                 mw.n_hebb += 1
         mw.prophecies = [[target, strength, age] for target, strength, age in cur.execute(
             "SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT ?", (MAX_PROPHECY,)
@@ -676,66 +693,68 @@ def load_memory_sqlite(mw, path, periodic=None, chambers=None):
                 chambers.phase_lock = clampf(max(chambers.phase_lock, 0.16 * avg_div + 0.12 * avg_cons), 0.0, 1.0)
         conn.close()
         return True
-    except Exception:
+    except Exception as e:
+        print("WARNING: %s not loaded: %s" % (path, e), file=sys.stderr)
         return False
 def save_memory_sqlite(mw, path, periodic=None, chambers=None, events=None):
     conn = sqlite3.connect(path)
-    sqlite_init(conn)
-    cur = conn.cursor()
-    cur.executescript("""
-    DELETE FROM bigrams;
-    DELETE FROM trigrams;
-    DELETE FROM hebb;
-    DELETE FROM prophecies;
-    DELETE FROM periodic_elements;
-    DELETE FROM chambers;
-    """)
-    cur.executemany("INSERT INTO bigrams(a,b,prob) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.bigrams[:mw.n_bi]])
-    cur.executemany("INSERT INTO trigrams(a,b,c,prob) VALUES(?,?,?,?)", [(a, b, c, p) for a, b, c, p in mw.trigrams[:mw.n_tri]])
-    cur.executemany("INSERT INTO hebb(a,b,strength) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.hebbs[:mw.n_hebb]])
-    cur.executemany("INSERT INTO prophecies(target,strength,age) VALUES(?,?,?)", [(target, strength, age) for target, strength, age in mw.prophecies[:MAX_PROPHECY]])
-    if periodic is not None:
-        cur.executemany("INSERT INTO periodic_elements(word,chamber,mass) VALUES(?,?,?)",
-                        [(word, elem["ch"], elem["mass"]) for word, elem in periodic.elements.items()])
-    if chambers is not None:
-        cur.execute(
-            "INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,?,?,?,?,?,?,?,?,?)",
-            (clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), *[clampf(v, 0.0, 1.0) for v in chambers.soma])
-        )
-        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)", (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
-        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state',?)", (str(clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0)),))
-        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock',?)", (str(clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0)),))
-        cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias',?)", (str(clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)),))
-    cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
-                (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
-    episode_id = cur.lastrowid
-    if events is not None:
-        cur.executemany(
-            "INSERT INTO scar_events(episode_id,step,scar,note) VALUES(?,?,?,?)",
-            [(episode_id, ev["step"], ev["scar"], ev.get("note", "")) for ev in events.get("scars", [])]
-        )
-        cur.executemany(
-            "INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES(?,?,?,?,?)",
-            [(episode_id, ev["step"], 1 if ev.get("success") else 0, ev["coherence"], ev["debt"]) for ev in events.get("wormholes", [])]
-        )
-        cur.executemany(
-            "INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES(?,?,?,?)",
-            [(episode_id, ev["step"], ev["pressure"], ev["debt"]) for ev in events.get("prophecies", [])]
-        )
-        cur.executemany(
-            "INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES(?,?,?,?,?,?,?)",
-            [(episode_id, ev["step"], ev["phase"], ev["flow"], ev["fear"], ev["void"], ev["complexity"]) for ev in events.get("phases", [])]
-        )
-        cur.executemany(
-            "INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
-            [(episode_id, ev["step"], ev.get("doc_name"), ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])]
-        )
-        cur.executemany(
-            "INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES(?,?,?,?,?,?,?,?,?)",
-            [(episode_id, ev["step"], ev["experts"], ev["winners"], ev["diversity"], ev["avg_vitality"], ev["births"], ev["deaths"], ev["consolidations"]) for ev in events.get("parliament", [])]
-        )
-    conn.commit()
-    conn.close()
+    try:
+        sqlite_init(conn)
+        cur = conn.cursor()
+        # one transaction: a failed insert rolls the deletes back, the previous memory survives
+        cur.execute("BEGIN")
+        for table in ("bigrams", "trigrams", "hebb", "prophecies", "periodic_elements", "chambers"):
+            cur.execute("DELETE FROM " + table)
+        cur.executemany("INSERT INTO bigrams(a,b,prob) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.bigrams[:mw.n_bi]])
+        cur.executemany("INSERT INTO trigrams(a,b,c,prob) VALUES(?,?,?,?)", [(a, b, c, p) for a, b, c, p in mw.trigrams[:mw.n_tri]])
+        cur.executemany("INSERT INTO hebb(a,b,strength) VALUES(?,?,?)", [(a, b, p) for a, b, p in mw.hebbs[:mw.n_hebb]])
+        cur.executemany("INSERT INTO prophecies(target,strength,age) VALUES(?,?,?)", [(target, strength, age) for target, strength, age in mw.prophecies[:MAX_PROPHECY]])
+        if periodic is not None:
+            cur.executemany("INSERT INTO periodic_elements(word,chamber,mass) VALUES(?,?,?)",
+                            [(word, elem["ch"], elem["mass"]) for word, elem in periodic.elements.items()])
+        if chambers is not None:
+            cur.execute(
+                "INSERT INTO chambers(id,presence,debt,trauma,soma0,soma1,soma2,soma3,soma4,soma5) VALUES(1,?,?,?,?,?,?,?,?,?)",
+                (clampf(chambers.presence, 0.0, 1.0), clampf(chambers.debt, 0.0, 1.0), clampf(chambers.trauma, 0.0, 1.0), *[clampf(v, 0.0, 1.0) for v in chambers.soma])
+            )
+            cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('scar',?)", (str(clampf(getattr(chambers, "scar", 0.0), 0.0, 1.0)),))
+            cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('coherence_state',?)", (str(clampf(getattr(chambers, "coherence", 0.0), 0.0, 1.0)),))
+            cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('phase_lock',?)", (str(clampf(getattr(chambers, "phase_lock", 0.0), 0.0, 1.0)),))
+            cur.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('threshold_bias',?)", (str(clampf(getattr(chambers, "threshold_bias", 0.0), 0.0, 1.0)),))
+        cur.execute("INSERT INTO episodes(kind,payload) VALUES('snapshot', ?)",
+                    (f"bi={mw.n_bi};tri={mw.n_tri};hebb={mw.n_hebb};prophecy={len(mw.prophecies)}",))
+        episode_id = cur.lastrowid
+        if events is not None:
+            cur.executemany(
+                "INSERT INTO scar_events(episode_id,step,scar,note) VALUES(?,?,?,?)",
+                [(episode_id, ev["step"], ev["scar"], ev.get("note", "")) for ev in events.get("scars", [])]
+            )
+            cur.executemany(
+                "INSERT INTO wormhole_events(episode_id,step,success,coherence,debt) VALUES(?,?,?,?,?)",
+                [(episode_id, ev["step"], 1 if ev.get("success") else 0, ev["coherence"], ev["debt"]) for ev in events.get("wormholes", [])]
+            )
+            cur.executemany(
+                "INSERT INTO prophecy_events(episode_id,step,pressure,debt) VALUES(?,?,?,?)",
+                [(episode_id, ev["step"], ev["pressure"], ev["debt"]) for ev in events.get("prophecies", [])]
+            )
+            cur.executemany(
+                "INSERT INTO phase_events(episode_id,step,phase,flow,fear,void,complexity) VALUES(?,?,?,?,?,?,?)",
+                [(episode_id, ev["step"], ev["phase"], ev["flow"], ev["fear"], ev["void"], ev["complexity"]) for ev in events.get("phases", [])]
+            )
+            cur.executemany(
+                "INSERT INTO chunk_events(episode_id,step,doc_name,chunk_start,resonance) VALUES(?,?,?,?,?)",
+                [(episode_id, ev["step"], ev.get("doc_name"), ev["chunk_start"], ev["resonance"]) for ev in events.get("chunks", [])]
+            )
+            cur.executemany(
+                "INSERT INTO parliament_events(episode_id,step,experts,winners,diversity,avg_vitality,births,deaths,consolidations) VALUES(?,?,?,?,?,?,?,?,?)",
+                [(episode_id, ev["step"], ev["experts"], ev["winners"], ev["diversity"], ev["avg_vitality"], ev["births"], ev["deaths"], ev["consolidations"]) for ev in events.get("parliament", [])]
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 def consolidate_experience(mw, periodic=None, chambers=None, events=None):
     if events is None:
         return
@@ -1962,6 +1981,19 @@ def starts_with_space(bpe, tid):
     if len(b) == 0:
         return False
     return b[0] == ord(' ')
+def is_sentence_start(bpe, ids, p):
+    # token p-1 ends a sentence ([.!?] then only whitespace) and token p starts a word: after its own space,
+    # or capitalised when BPE glued the space onto the period (". " / ".\n\n" + "The")
+    if p <= 0 or not (0 <= ids[p - 1] < bpe.vocab_size and 0 <= ids[p] < bpe.vocab_size):
+        return False
+    prev = bpe.vocab_bytes.get(ids[p - 1], b"")
+    cur = bpe.vocab_bytes.get(ids[p], b"")
+    body = prev.rstrip(b" \t\n\r\v\f")
+    if not body or not cur or body[-1] not in b".!?":
+        return False
+    if cur[0] == ord(' '):
+        return True
+    return len(body) < len(prev) and (ord('A') <= cur[0] <= ord('Z') or ord('0') <= cur[0] <= ord('9') or cur[0] in b"\"'")
 def opens_segment(bpe, tid):
     if tid < 0 or tid >= bpe.vocab_size:
         return True
@@ -2357,6 +2389,9 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
     print()
 
     gdest = [0.0] * t.D
+    starts = [p for p in range(1, clen - 4) if is_sentence_start(bpe, cids, p)]  # what prompt selection draws from
+    if len(starts) < CHAIN_STEPS // 2:
+        starts = []  # fewer starts than half the chain would repeat the same openings: keep random positions
     spa = SPACtx()
     spa_init(spa, t.V)
     chain_ids = [[] for _ in range(CHAIN_STEPS)]
@@ -2398,28 +2433,20 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
         pl = len(prompt) if prompt is not None else 0
         if prompt is None:
             start = -1
-            if direction >= 0 and si > 0:
+            if starts and direction >= 0 and si > 0:
                 best_score = -1e30
-                best_pos = -1
                 for _try in range(50):
-                    r = random.randint(0, max(0, clen - 6))
-                    if is_boundary(bpe, cids[r]) and r + 3 < clen and starts_with_space(bpe, cids[r + 1]):
-                        sc = 0.0
-                        tok_id = cids[r + 1]
-                        if tok_id < t.V:
-                            for d in range(t.D):
-                                sc += t.tok[tok_id * t.D + d] * gdest[d]
-                        if sc > best_score:
-                            best_score = sc
-                            best_pos = r + 1
-                if best_pos >= 0:
-                    start = best_pos
-            if start < 0:
-                for _try in range(200):
-                    r = random.randint(0, max(0, clen - 6))
-                    if is_boundary(bpe, cids[r]) and r + 3 < clen and starts_with_space(bpe, cids[r + 1]):
-                        start = r + 1
-                        break
+                    p = random.choice(starts)
+                    sc = 0.0
+                    tok_id = cids[p]
+                    if tok_id < t.V:
+                        for d in range(t.D):
+                            sc += t.tok[tok_id * t.D + d] * gdest[d]
+                    if sc > best_score:
+                        best_score = sc
+                        start = p
+            if start < 0 and starts:
+                start = random.choice(starts)
             if start < 0:
                 start = random.randint(0, max(0, clen - 6))
             pl = 5 if start + 5 <= clen else 3
@@ -2461,8 +2488,10 @@ def gen_chain(t, bpe, mw, ch, cids, clen, has_weights, parl, periodic=None, inte
                 best_sc = sc
                 best_ol = len(result)
                 best_out = list(result)
+                gdest_best = list(gdest)
             if best_q > 0.1 and best_sc > 1.0 and best_ol > 12:
                 break
+        gdest[:] = gdest_best  # the chosen candidate's destiny goes forward, not the last one's
 
         wormhole = False
         if si < CHAIN_STEPS - 1:
@@ -2594,7 +2623,15 @@ def main():
         print("Usage: %s [weights.bin] corpus.merges corpus.txt" % sys.argv[0])
         sys.exit(1)
 
-    random.seed(int(time.time()))
+    q_seed = os.environ.get("Q_SEED")
+    if q_seed:
+        try:
+            random.seed(int(q_seed))
+        except ValueError:
+            print("ERROR: Q_SEED must be a non-negative integer", file=sys.stderr)
+            sys.exit(1)
+    else:
+        random.seed(int(time.time()))
 
     has_weights = False
     wpath = None
@@ -2639,6 +2676,7 @@ def main():
             sys.exit(1)
     else:
         print("[4] No weights \u2014 MetaWeights only mode")
+        print("  destiny and parliament are silent here: zero embeddings give them no direction (load weights to wake them)")
         t.V = bpe.vocab_size; t.D = 48; t.NH = 4; t.NL = 1
         t.CTX = 64; t.NC = 2; t.NR = 2; t.NJ = 0; t.HD = 12
         t.tok = [0.0] * (t.V * t.D)
@@ -2707,15 +2745,24 @@ def main():
         pass
 
     # save memory
+    consolidate_experience(mw, periodic, ch, run_events)
+    save_ok = True
     try:
-        consolidate_experience(mw, periodic, ch, run_events)
         save_memory_sqlite(mw, "q.sqlite", periodic, ch, run_events)
+    except Exception as e:
+        save_ok = False
+        print("ERROR: q.sqlite save failed, previous memory kept: %s" % e, file=sys.stderr)
+    try:
         save_memory(mw, "q.memory", periodic, ch)
         save_spore(mw, spore_path, periodic, ch)
+    except Exception as e:
+        save_ok = False
+        print("ERROR: q.memory/spore save failed: %s" % e, file=sys.stderr)
+    if save_ok:
         print("  [memory saved: %d bi, %d tri, %d hebb, %d periodic \u2192 q.sqlite + q.memory]" % (mw.n_bi, mw.n_tri, mw.n_hebb, len(periodic.elements)))
-    except Exception:
-        pass
 
     print("\nresonance is unbreakable.")
+    if not save_ok:
+        sys.exit(1)
 if __name__ == "__main__":
     main()

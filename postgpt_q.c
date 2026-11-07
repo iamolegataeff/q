@@ -1236,6 +1236,20 @@ static int starts_with_space(const BPE *bpe, int id){
     if(id<0||id>=bpe->vocab_size||bpe->vocab_len[id]==0)return 0;
     return bpe->vocab_bytes[id][0]==' ';
 }
+/* corpus position p opens a sentence: token p-1 ends one ([.!?] then only whitespace) and token p starts a word —
+   after its own space, or capitalised when BPE glued the space onto the period (". " / ".\n\n" + "The") */
+static int is_sentence_start(const BPE *bpe, const int *ids, int p){
+    if(p<=0) return 0;
+    int prev=ids[p-1], cur=ids[p];
+    if(prev<0||prev>=bpe->vocab_size||cur<0||cur>=bpe->vocab_size||bpe->vocab_len[cur]==0) return 0;
+    int i=bpe->vocab_len[prev]-1, ws=0;
+    while(i>=0&&isspace(bpe->vocab_bytes[prev][i])){i--;ws=1;}
+    if(i<0) return 0;
+    uint8_t c=bpe->vocab_bytes[prev][i], f=bpe->vocab_bytes[cur][0];
+    if(c!='.'&&c!='!'&&c!='?') return 0;
+    if(f==' ') return 1;
+    return ws&&(isupper(f)||isdigit(f)||f=='"'||f=='\'');
+}
 static int opens_segment(const BPE *bpe, int id){
     if(id<0||id>=bpe->vocab_size) return 1;
     for(int i=bpe->vocab_len[id]-1;i>=0;i--){
@@ -1514,6 +1528,17 @@ static void spa_cross_attend(const SPACtx *s, float embs[][SPA_DIM], int S, floa
     }
 }
 
+/* forward prompt choice: 50 corpus sentence starts drawn at random, the one whose first token aligns best with destiny wins */
+static int destiny_start(const TF *t, const int *cids, const int *starts, int ns, const float *gdest){
+    int start=-1; float best_score=-1e30f;
+    for(int k=0;k<50;k++){
+        int p=starts[rand()%ns]; float sc=0; int tok=cids[p];
+        if(tok<t->V) for(int d=0;d<t->D;d++) sc+=t->tok[tok*t->D+d]*gdest[d];
+        if(sc>best_score){best_score=sc;start=p;}
+    }
+    return start;
+}
+
 /* ── chain ── */
 static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
                       const int *cids, int clen, int has_weights, Parliament *parl,
@@ -1553,6 +1578,9 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     printf("\n\n");
 
     float *gdest=calloc(t->D,sizeof(float)); /* persistent destiny across chain */
+    int *starts=malloc((clen>0?clen:1)*sizeof(int)), ns=0; /* corpus sentence starts: what prompt selection draws from */
+    for(int p=1;p+4<clen;p++) if(is_sentence_start(bpe,cids,p)) starts[ns++]=p;
+    if(ns<CHAIN_STEPS/2) ns=0; /* fewer starts than half the chain would repeat the same openings: keep random positions */
     SPACtx spa; spa_init(&spa,t->V);
     int chain_ids[CHAIN_STEPS][256]; int chain_lens[CHAIN_STEPS];
     for(int si=0;si<CHAIN_STEPS;si++){
@@ -1583,27 +1611,8 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         }
         if(plen==0){
             int start=-1;
-            if(dir>=0&&si>0){
-                float best_score=-1e30f;int best_pos=-1,tries2=0;
-                while(tries2<50){
-                    int r=rand()%(clen>5?clen-5:1);
-                    if(is_boundary(bpe,cids[r])&&r+3<clen&&starts_with_space(bpe,cids[r+1])){
-                        float sc=0;int tok=cids[r+1];
-                        if(tok<t->V) for(int d=0;d<t->D;d++) sc+=t->tok[tok*t->D+d]*gdest[d];
-                        if(sc>best_score){best_score=sc;best_pos=r+1;}
-                    }
-                    tries2++;
-                }
-                if(best_pos>=0) start=best_pos;
-            }
-            if(start<0){
-                int tries=0;
-                while(start<0&&tries<200){
-                    int r=rand()%(clen>5?clen-5:1);
-                    if(is_boundary(bpe,cids[r])&&r+3<clen&&starts_with_space(bpe,cids[r+1])){start=r+1;break;}
-                    tries++;
-                }
-            }
+            if(ns>0&&dir>=0&&si>0) start=destiny_start(t,cids,starts,ns,gdest);
+            if(start<0&&ns>0) start=starts[rand()%ns];
             if(start<0) start=rand()%(clen>5?clen-5:1);
             plen=start+5<=clen?5:3;
             prompt[0]=cids[start];prompt[1]=cids[start+1];prompt[2]=cids[start+2];
@@ -1618,7 +1627,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
         /* best-of-3: generate 3 candidates, pick highest coherence */
         int best_out[256],best_ol=0; float best_sc=-1e30f;
         float best_q=-1e30f;
-        float gdest_save[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
+        float gdest_save[256],gdest_best[256]; if(t->D<=256) memcpy(gdest_save,gdest,t->D*sizeof(float));
         int cand_trials=(!has_weights&&si<=1)?5:3;
         for(int cand=0;cand<cand_trials;cand++){
             if(cand>0&&t->D<=256) memcpy(gdest,gdest_save,t->D*sizeof(float)); /* restore destiny */
@@ -1628,9 +1637,10 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
             float sc=coherence_score(mw,out,ol,t->V)+0.6f*surface_coherence_score(bpe,out,ol);
             float q_sc=(!has_weights&&si<=1)?early_sentence_quality(bpe,out,ol):sc;
             if(q_sc>best_q) best_q=q_sc;
-            if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int));}
+            if(sc>best_sc){best_sc=sc;best_ol=ol;memcpy(best_out,out,ol*sizeof(int)); if(t->D<=256) memcpy(gdest_best,gdest,t->D*sizeof(float));}
             if(best_q>0.1f&&best_sc>1.0f&&best_ol>12) break; /* early exit if first candidate is strong */
         }
+        if(t->D<=256) memcpy(gdest,gdest_best,t->D*sizeof(float)); /* the chosen candidate's destiny goes forward, not the last one's */
         int wormhole=0;
         if(si<CHAIN_STEPS-1){
             float wh_prob=0.02f;
@@ -1717,7 +1727,7 @@ static void gen_chain(TF *t, const BPE *bpe, MetaW *mw, Chambers *ch,
     }
     /* Hebbian decay: old memories fade after each chain */
     for(int i=0;i<mw->n_hebb;i++) mw->hebbs[i].str*=0.998f;
-    free(gdest);
+    free(gdest); free(starts);
 }
 
 /* ── main ── */
@@ -1749,14 +1759,22 @@ static int qsqlite_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers
     fp=popen(cmd,"r"); if(!fp) return 0;
     while(fgets(line,sizeof(line),fp)){
         int a,b,c; float p;
-        if(sscanf(line,"%d\t%d\t%d\t%f",&a,&b,&c,&p)==4 && mw->n_tri<MAX_TRIGRAM){mw->trigrams[mw->n_tri].a=a;mw->trigrams[mw->n_tri].b=b;mw->trigrams[mw->n_tri].c=c;mw->trigrams[mw->n_tri].prob=p;mw->n_tri++;}
+        if(sscanf(line,"%d\t%d\t%d\t%f",&a,&b,&c,&p)==4){
+            int found=0;
+            for(int j=0;j<mw->n_tri;j++) if(mw->trigrams[j].a==a&&mw->trigrams[j].b==b&&mw->trigrams[j].c==c){ if(p>mw->trigrams[j].prob) mw->trigrams[j].prob=p; found=1; break; }
+            if(!found&&mw->n_tri<MAX_TRIGRAM){mw->trigrams[mw->n_tri].a=a;mw->trigrams[mw->n_tri].b=b;mw->trigrams[mw->n_tri].c=c;mw->trigrams[mw->n_tri].prob=p;mw->n_tri++;}
+        }
     }
     pclose(fp);
     snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT a,b,strength FROM hebb;\"",path);
     fp=popen(cmd,"r"); if(!fp) return 0;
     while(fgets(line,sizeof(line),fp)){
         int a,b; float p;
-        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3 && mw->n_hebb<MAX_HEBBIAN){mw->hebbs[mw->n_hebb].a=a;mw->hebbs[mw->n_hebb].b=b;mw->hebbs[mw->n_hebb].str=p;mw->n_hebb++;}
+        if(sscanf(line,"%d\t%d\t%f",&a,&b,&p)==3){
+            int found=0;
+            for(int j=0;j<mw->n_hebb;j++) if(mw->hebbs[j].a==a&&mw->hebbs[j].b==b){ if(p>mw->hebbs[j].str) mw->hebbs[j].str=p; found=1; break; }
+            if(!found&&mw->n_hebb<MAX_HEBBIAN){mw->hebbs[mw->n_hebb].a=a;mw->hebbs[mw->n_hebb].b=b;mw->hebbs[mw->n_hebb].str=p;mw->n_hebb++;}
+        }
     }
     pclose(fp);
     snprintf(cmd,sizeof(cmd),"sqlite3 -tabs -noheader '%s' \"SELECT target,strength,age FROM prophecies ORDER BY age DESC LIMIT %d;\"",path,MAX_PROPHECY);
@@ -1875,7 +1893,8 @@ static int qsqlite_save(const MetaW *mw, const char *path, const PeriodicTable *
     fprintf(sf,"COMMIT;\n");
     fclose(sf);
     char cmd[768];
-    snprintf(cmd,sizeof(cmd),"sqlite3 '%s' < '%s' >/dev/null 2>&1",path,tpl);
+    /* -bail: the first failed statement aborts before COMMIT, so the DELETEs roll back with it */
+    snprintf(cmd,sizeof(cmd),"sqlite3 -bail '%s' < '%s' >/dev/null 2>&1",path,tpl);
     int ok=system(cmd)==0;
     unlink(tpl);
     return ok;
@@ -1930,7 +1949,9 @@ static int qspore_load(MetaW *mw, const char *path, PeriodicTable *pt, Chambers 
 int main(int argc, char **argv){
     printf("PostGPT-Q — Resonant Reasoning Engine (C)\ntheta = epsilon + gamma + alpha*delta\nresonance is unbreakable.\n\n");
     if(argc<3){printf("Usage: %s [weights.bin] corpus.merges corpus.txt\n",argv[0]);return 1;}
-    srand((unsigned)time(NULL));
+    {const char *qs=getenv("Q_SEED"); unsigned seed=(unsigned)time(NULL);
+    if(qs&&qs[0]){char *end; unsigned long v=strtoul(qs,&end,10); if(*end){fprintf(stderr,"ERROR: Q_SEED must be a non-negative integer\n");return 1;} seed=(unsigned)v;}
+    srand(seed);}
 
     int has_weights=0; const char *wpath=NULL,*mpath,*cpath;
     if(argc>=4){wpath=argv[1];mpath=argv[2];cpath=argv[3];has_weights=1;}
@@ -1959,6 +1980,7 @@ int main(int argc, char **argv){
         if(!tf_load(&t,wpath)) return 1;
     }else{
         printf("[4] No weights — MetaWeights only mode\n");
+        printf("  destiny and parliament are silent here: zero embeddings give them no direction (load weights to wake them)\n");
         /* create minimal transformer with zero weights — gate will silence it */
         t.V=bpe.vocab_size;t.D=48;t.NH=4;t.NL=1;t.CTX=64;t.NC=2;t.NR=2;t.NJ=0;t.HD=12;
         t.tok=calloc((size_t)t.V*t.D,sizeof(float));t.pos=calloc((size_t)t.CTX*t.D,sizeof(float));
@@ -2066,7 +2088,8 @@ int main(int argc, char **argv){
     }
     /* save evolved MetaWeights — Q remembers between sessions */
     consolidate_experience(mw,&pt,&ch);
-    qsqlite_save(mw,"q.sqlite",&pt,&ch);
+    int save_ok=qsqlite_save(mw,"q.sqlite",&pt,&ch);
+    if(!save_ok) fprintf(stderr,"ERROR: q.sqlite save failed, previous memory kept\n");
     {FILE *mf=fopen("q.memory","wb");
     if(mf){
         uint32_t magic=0x514D454D; /* QMEM */
@@ -2094,8 +2117,8 @@ int main(int argc, char **argv){
         fwrite(&ch.phase_lock,4,1,mf);
         fwrite(&ch.threshold_bias,4,1,mf);}
         {const char *spore_path="spores/q.spore.bin";
-        fclose(mf); qspore_save(mw,spore_path,&pt,&ch); printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.sqlite + q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);}
-    }}
+        fclose(mf); qspore_save(mw,spore_path,&pt,&ch); if(save_ok) printf("  [memory saved: %d bi, %d tri, %d hebb, %d periodic → q.sqlite + q.memory]\n",mw->n_bi,mw->n_tri,mw->n_hebb,pt.n);}
+    }else{fprintf(stderr,"ERROR: q.memory save failed\n"); save_ok=0;}}
     printf("\nresonance is unbreakable.\n");
-    free(cids);free(mw);return 0;
+    free(cids);free(mw);return save_ok?0:1;
 }

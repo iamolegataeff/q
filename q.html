@@ -5,26 +5,24 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PostGPT-Q</title>
 <style>
-@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Instrument+Serif:ital@0;1&display=swap');
-
 :root {
-  --void: #06060a;
-  --surface: #0c0c14;
-  --panel: #10101c;
-  --edge: #1a1a2e;
-  --dim: #3a3a50;
-  --mute: #555570;
-  --text: #b8b8cc;
-  --bright: #e0e0f0;
+  --void: #000000;
+  --surface: #161514;
+  --panel: #000000;
+  --edge: #2c2c2e;
+  --dim: #6e6e73;
+  --mute: #a1a1a6;
+  --text: #d2d2d7;
+  --bright: #ecebe8;
   --fear: #c85a3a;
   --love: #d46a9f;
   --rage: #e84040;
   --void-ch: #6868aa;
   --flow: #4a9ad4;
   --cmplx: #5ab87a;
-  --accent: #d4a06a;
+  --accent: #ff6b1f;
   --backward: #4a9a6a;
-  --pivot: #d4a040;
+  --pivot: #ff6b1f;
   --forward: #5a8ad4;
   --mono: 'JetBrains Mono', 'Fira Code', monospace;
   --serif: 'Instrument Serif', Georgia, serif;
@@ -48,7 +46,7 @@ body {
   display: flex; align-items: center; justify-content: space-between;
   padding: 12px 20px;
   border-bottom: 1px solid var(--edge);
-  background: linear-gradient(180deg, #0e0e18 0%, var(--void) 100%);
+  background: linear-gradient(180deg, var(--surface) 0%, var(--void) 100%);
 }
 #hdr h1 {
   font-family: var(--serif);
@@ -237,12 +235,48 @@ const DARK_MATTER_WORDS={
 
 // ── Globals ──
 let bpe=null, mw=null, tf=null, chambers=null, parliament=null, corpusIds=null, periodic=null, interference=null;
+let corpusText=null, loadedMerges=null;
+
+// ?seed=<n> replaces Math.random with a seeded mulberry32 stream: repeatable runs of this body (Q_SEED of the native engines)
+const qRandom=(()=>{
+  const s=new URLSearchParams(window.location.search).get('seed');
+  if(s===null)return Math.random;
+  if(!/^\d+$/.test(s)){console.warn('seed must be a non-negative integer, using Math.random');return Math.random;}
+  let a=Number(s)>>>0;
+  return()=>{a=(a+0x6D2B79F5)>>>0;let t=a;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;};
+})();
 
 // ── UI ──
 const $=s=>document.querySelector(s);
 const out=$('#out'), stats=$('#stats');
 
+// embed bridge: a page that frames q.html (index.html) drives it by postMessage and watches its state.
+// Read-only taps, no qRandom draws: inert when q.html is opened directly.
+const qEmbedded=window.parent!==window;
+const qExpertIds=new WeakMap();let qNextExpert=1;
+function qTap(kind,data={}){if(qEmbedded)parent.postMessage({q:kind,...data},'*');}
+function qState(){
+  const s={trained:!!(tf&&tf.loaded)};
+  if(chambers)s.chambers={act:[...chambers.act],debt:chambers.debt,trauma:chambers.trauma,scar:chambers.scar,presence:chambers.presence,phaseLock:chambers.phaseLock};
+  if(parliament)s.parliament={winners:[...parliament.lastWinners],diversity:parliament.lastDiversity,experts:parliament.experts.map(e=>{
+    if(!qExpertIds.has(e))qExpertIds.set(e,qNextExpert++);
+    return {id:qExpertIds.get(e),vitality:e.vitality,overload:e.overload,age:e.age,consolidations:e.consolidations};
+  })};
+  if(mw&&bpe)s.field={tokens:corpusIds?corpusIds.length:0,bi:mw.bigramCount,tri:mw.tri.size,hebb:mw.hebb.size,prophecy:mw.prophecies.map(([t,st,age])=>({word:bpe.decode([t]),strength:st,age}))};
+  if(tf&&tf.loaded)s.tf={V:tf.V,D:tf.D,L:tf.NL,nc:tf.NC,nr:tf.NR,nj:tf.NJ};
+  return s;
+}
+function qMemory(){
+  try{
+    const raw=localStorage.getItem('q.memory');
+    if(!raw)return {bytes:0};
+    const m=JSON.parse(raw),c=m.chambers||{};
+    return {bytes:raw.length,bi:(m.bi||[]).length,tri:(m.tri||[]).length,hebb:(m.hebb||[]).length,periodic:(m.periodic||[]).length,phaseLock:c.phaseLock||0,scar:c.scar||0};
+  }catch(err){return {blocked:err.name};}
+}
+
 function log(msg,cls='meta'){
+  qTap('log',{cls,text:msg});
   if($('#splash'))$('#splash').remove();
   const d=document.createElement('div');d.className='line '+cls;d.textContent=msg;
   out.appendChild(d);out.scrollTop=out.scrollHeight;
@@ -256,6 +290,7 @@ function addStep(num,dir,text){
   if($('#splash'))$('#splash').remove();
   const cls=dir<0?'bwd':dir===0?'pvt':'fwd';
   const mk=dir<0?'<':dir===0?'*':'>';
+  qTap('step',{num,dir,text,state:qState()});
   const d=document.createElement('div');d.className='line step '+cls;
   d.innerHTML=`<span class="num">[${String(num).padStart(2)}]</span><span class="dir">${mk}</span> <span class="txt">${esc(text)}</span>`;
   out.appendChild(d);out.scrollTop=out.scrollHeight;
@@ -340,21 +375,55 @@ class BPE {
     return new TextDecoder('utf-8',{fatal:false}).decode(new Uint8Array(bytes));
   }
 
-  isBoundary(id){
-    const b=this.vocabBytes[id];if(!b)return false;
+  // byte offset where a sentence ends inside token id, -1 if none: after a [.!?] run and the quotes/brackets closing it,
+  // when the token ends there or whitespace follows. BPE fuses an end with the next opening (". It", ".\n\nThe "), so the
+  // token that stops a sentence can carry the first bytes of the next one past this offset.
+  boundaryEnd(id){
+    const b=this.vocabBytes[id];if(!b)return -1;
+    const term=c=>c===46||c===33||c===63,closer=c=>c===34||c===39||c===41||c===93||c===125;
     for(let i=0;i<b.length;i++){
-      if(b[i]===46||b[i]===33||b[i]===63){
-        if(i===b.length-1)return true;
-        if(b[i+1]===32||b[i+1]===10||b[i+1]===13)return true;
-      }
+      if(!term(b[i]))continue;
+      let j=i+1;
+      while(j<b.length&&(term(b[j])||closer(b[j])))j++;
+      if(j===b.length||b[j]===32||b[j]===10||b[j]===13)return j;
+      i=j-1;
     }
-    return false;
+    return -1;
+  }
+  isBoundary(id){return this.boundaryEnd(id)>=0;}
+  decodeSentence(ids){
+    const bytes=[];
+    for(const id of ids){const b=this.vocabBytes[id];if(b)bytes.push(...b);}
+    const last=ids.length?ids[ids.length-1]:-1,e=this.boundaryEnd(last);
+    if(e>=0)bytes.length-=this.vocabBytes[last].length-e;
+    return new TextDecoder('utf-8',{fatal:false}).decode(new Uint8Array(bytes));
   }
 
   startsWithSpace(id){
     const b=this.vocabBytes[id];
     if(!b||!b.length)return false;
     return b[0]===32;
+  }
+  // token p-1 ends a sentence ([.!?] then only whitespace) and token p starts a word: after its own space,
+  // or capitalised when BPE glued the space onto the period (". " / ".\n\n" + "The") — same rule as postgpt_q.c
+  isSentenceStart(ids,p){
+    if(p<=0)return false;
+    const prev=this.vocabBytes[ids[p-1]],cur=this.vocabBytes[ids[p]];
+    if(!prev||!cur||!cur.length)return false;
+    let i=prev.length-1;
+    while(i>=0&&(prev[i]===32||(prev[i]>=9&&prev[i]<=13)))i--;
+    if(i<0||(prev[i]!==46&&prev[i]!==33&&prev[i]!==63))return false;
+    const f=cur[0];
+    if(f===32)return true;
+    return i<prev.length-1&&((f>=65&&f<=90)||(f>=48&&f<=57)||f===34||f===39);
+  }
+  findToken(word){
+    const w=new TextEncoder().encode(word);
+    for(let i=0;i<this.vocabSize;i++){
+      const b=this.vocabBytes[i];
+      if(b&&b.length===w.length&&b.every((x,j)=>x===w[j]))return i;
+    }
+    return -1;
   }
   opensSegment(id){
     const b=this.vocabBytes[id];
@@ -365,6 +434,11 @@ class BPE {
       return c===40||c===91||c===123||c===34||c===39||c===58||c===59;
     }
     return true;
+  }
+  // text cut after this token leaves no word open: whitespace ends it, so nothing sampled next can fuse with the word before
+  endsOnSpace(id){
+    const b=this.vocabBytes[id],c=b&&b.length?b[b.length-1]:-1;
+    return c===32||(c>=9&&c<=13);
   }
   isLowerFragmentStart(id){
     const b=this.vocabBytes[id];
@@ -903,7 +977,7 @@ class Interference {
       }
       if(prophecyWords.has(word))score+=0.9*prophecyWords.get(word);
     }
-    score+=Math.random()*0.05;
+    score+=qRandom()*0.05;
     return score;
   }
   chooseDoc(text,currentChambers,currentPeriodic,currentMw,currentBpe){
@@ -934,14 +1008,14 @@ class Interference {
   }
   injectSeed(currentChambers,currentBpe,currentPeriodic){
     if(!this.docs.length)return null;
-    const doc=this.docs[Math.floor(Math.random()*this.docs.length)];
+    const doc=this.docs[Math.floor(qRandom()*this.docs.length)];
     const dom=currentChambers.dominant();
     const heavy=doc.heavy.filter(tid=>currentBpe.isCleanSeedToken(tid));
     const candidates=heavy.length?heavy:doc.heavy;
     let best=candidates[0],bestScore=-Infinity;
     for(const tid of candidates){
       const word=currentBpe.decode([tid]).trim().toLowerCase();
-      let score=Math.random()*0.05;
+      let score=qRandom()*0.05;
       if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
       if(currentPeriodic){
         const el=currentPeriodic.classify(word);
@@ -959,7 +1033,7 @@ class Interference {
     let best=candidates[0],bestScore=-Infinity;
     for(const tid of candidates){
       const word=currentBpe.decode([tid]).trim().toLowerCase();
-      let score=Math.random()*0.05;
+      let score=qRandom()*0.05;
       if(word in ANCHORS&&ANCHORS[word]===dom)score+=1;
       if(currentPeriodic){
         const el=currentPeriodic.classify(word);
@@ -991,8 +1065,8 @@ class Expert {
     this.d=d;this.rank=rank;
     this.A=new Float32Array(rank*d);this.B=new Float32Array(d*rank);
     this.trace=new Float32Array(rank*d);
-    for(let i=0;i<rank*d;i++)this.A[i]=0.01*(Math.random()-0.5);
-    for(let i=0;i<d*rank;i++)this.B[i]=0.01*(Math.random()-0.5);
+    for(let i=0;i<rank*d;i++)this.A[i]=0.01*(qRandom()-0.5);
+    for(let i=0;i<d*rank;i++)this.B[i]=0.01*(qRandom()-0.5);
     this.vitality=1;this.overload=0;this.resonance=0;this.age=0;this.lowSteps=0;this.plasticityMass=0;this.consolidations=0;
   }
   forward(x){
@@ -1005,7 +1079,7 @@ class Expert {
   hebbian(x,dy,lr=0.001){
     for(let r=0;r<this.rank;r++){
       let u=0;for(let o=0;o<this.d;o++)u+=this.B[o*this.rank+r]*dy[o];
-      u+=0.01*(Math.random()-0.5);
+      u+=0.01*(qRandom()-0.5);
       for(let d=0;d<this.d;d++){
         const idx=r*this.d+d, delta=lr*x[d]*u;
         this.A[idx]+=delta;
@@ -1111,8 +1185,8 @@ class Parliament {
     for(const e of this.experts){
       if(e.vitality>0.70&&e.age>40&&e.overload>0.32&&this.experts.length+births.length<MAX_EXPERTS){
         const c=new Expert(e.d,e.rank);
-        for(let j=0;j<c.rank*c.d;j++)c.A[j]=e.A[j]+0.005*(Math.random()-0.5);
-        for(let j=0;j<c.d*c.rank;j++)c.B[j]=e.B[j]+0.005*(Math.random()-0.5);
+        for(let j=0;j<c.rank*c.d;j++)c.A[j]=e.A[j]+0.005*(qRandom()-0.5);
+        for(let j=0;j<c.d*c.rank;j++)c.B[j]=e.B[j]+0.005*(qRandom()-0.5);
         c.vitality=0.5;c.overload=0.18;c.resonance=0.5*e.resonance;births.push(c);e.vitality*=0.62;e.overload*=0.5;
       }
     }
@@ -1136,9 +1210,16 @@ function ingestIds(ids,amount=0.02){
   mw.bigramCount=mw.bi.size;
 }
 
+// token ids only mean something inside one merge table: memory remembers which one wrote it
+function vocabSignature(){
+  let h=2166136261;
+  for(const{a,b,nid}of bpe.merges)for(const v of [a,b,nid]){h^=v;h=Math.imul(h,16777619)>>>0;}
+  return bpe.merges.length+':'+h.toString(16);
+}
 function saveBrowserMemory(){
   if(!mw)return;
   const data={
+    vocab:vocabSignature(),
     bi:[...mw.bi.entries()],
     tri:[...mw.tri.entries()],
     hebb:[...mw.hebb.entries()]
@@ -1153,7 +1234,8 @@ function saveBrowserMemory(){
   if(parliament){
     data.parliament={lastK:parliament.lastK,lastEntropy:parliament.lastEntropy,lastDiversity:parliament.lastDiversity,lastWinners:[...parliament.lastWinners],lastBirths:parliament.lastBirths||0,lastDeaths:parliament.lastDeaths||0,lastConsolidations:parliament.lastConsolidations||0};
   }
-  localStorage.setItem('q.memory',JSON.stringify(data));
+  try{localStorage.setItem('q.memory',JSON.stringify(data));}
+  catch(err){log(`  memory not saved: ${err.name}`,'err');}
 }
 
 function loadBrowserMemory(){
@@ -1162,10 +1244,12 @@ function loadBrowserMemory(){
     const raw=localStorage.getItem('q.memory');
     if(!raw)return false;
     const mem=JSON.parse(raw);
-    for(const [k,v] of mem.bi||[])mw.bi.set(Number(k),Math.max(mw.bi.get(Number(k))||0,Number(v)));
-    for(const [k,v] of mem.tri||[])mw.tri.set(k,Math.max(mw.tri.get(k)||0,Number(v)));
-    for(const [k,v] of mem.hebb||[])mw.hebb.set(Number(k),Math.max(mw.hebb.get(Number(k))||0,Number(v)));
-    mw.bigramCount=mw.bi.size;
+    if(mem.vocab===vocabSignature()){
+      for(const [k,v] of mem.bi||[])mw.bi.set(Number(k),Math.max(mw.bi.get(Number(k))||0,Number(v)));
+      for(const [k,v] of mem.tri||[])mw.tri.set(k,Math.max(mw.tri.get(k)||0,Number(v)));
+      for(const [k,v] of mem.hebb||[])mw.hebb.set(Number(k),Math.max(mw.hebb.get(Number(k))||0,Number(v)));
+      mw.bigramCount=mw.bi.size;
+    }else log('  browser memory was written under another vocabulary: its token tables stay out, words and chambers come in','sys');
     // load periodic table
     if(mem.periodic&&periodic){
       for(const e of mem.periodic){
@@ -1215,7 +1299,7 @@ function sampleNucleus(logits,V,temp,topP){
   let cum=0,nk=probs.length;
   for(let i=0;i<probs.length;i++){cum+=probs[i];if(cum>=topP){nk=i+1;break;}}
   const nucTot=probs.slice(0,nk).reduce((s,p)=>s+p,0);
-  let r=Math.random()*nucTot,c=0;
+  let r=qRandom()*nucTot,c=0;
   for(let i=0;i<nk;i++){c+=probs[i];if(c>=r)return top[i];}
   return top[0];
 }
@@ -1256,15 +1340,18 @@ function promptFocusScale(hasTf,plen,step){
   return 1.0;
 }
 function anchoredPromptFromInput(text,maxTokens=4){
-  const inpIds=bpe.encode(text);
+  const inpIds=bpe.encode(text+' '); // the input comes trimmed: the space closes its last word, else the first sampled token fuses with it ("you"+"s " -> "yous ")
   if(!inpIds.length)return null;
+  const body=inpIds[inpIds.length-1]===32?inpIds.length-1:inpIds.length; // a bare space token at the tail is the one appended above, no place to start
   let start=0;
   if(!bpe.isCleanSeedToken(inpIds[start])){
     let found=false;
-    for(let i=1;i<inpIds.length;i++)if(bpe.startsWithSpace(inpIds[i])&&bpe.isCleanSeedToken(inpIds[i])){start=i;found=true;break;}
-    if(!found)for(let i=1;i<inpIds.length;i++)if(bpe.startsWithSpace(inpIds[i])){start=i;break;}
+    for(let i=1;i<body;i++)if(bpe.startsWithSpace(inpIds[i])&&bpe.isCleanSeedToken(inpIds[i])){start=i;found=true;break;}
+    if(!found)for(let i=1;i<body;i++)if(bpe.startsWithSpace(inpIds[i])){start=i;break;}
   }
-  return inpIds.slice(start,Math.min(inpIds.length,start+maxTokens));
+  let end=Math.min(inpIds.length,start+maxTokens);
+  while(end<inpIds.length&&end-start<maxTokens*8&&!bpe.endsOnSpace(inpIds[end-1]))end++; // the window ends on a space, never inside a word of the input
+  return inpIds.slice(start,end);
 }
 function earlySentenceQuality(ids){
   if(!ids.length)return-1;
@@ -1489,7 +1576,7 @@ class SPACtx {
     this.wEmbed=[];
     for(let i=0;i<V&&i<MAX_VOCAB;i++){
       const row=new Float32Array(SPA_DIM);
-      for(let d=0;d<SPA_DIM;d++)row[d]=0.02*(Math.random()-0.5);
+      for(let d=0;d<SPA_DIM;d++)row[d]=0.02*(qRandom()-0.5);
       this.wEmbed.push(row);
     }
     this.rBias=[];
@@ -1565,13 +1652,16 @@ function generateChain(inputText){
   log(`chambers: ${chambers.summary()}`,'sys');
   if(interference&&interference.docs.length)log(`interference: ${interference.docs.length} docs loaded`,'sys');
   updateStats();
+  qTap('chain',{diss:cd,velocity:velocity.name,gate:phaseGate,backward:nb,prompted:!!inputText,state:qState()});
 
   const gdest=new Float32Array(D);
   const spa=new SPACtx(V);
   const chainIds=[],chainLens=[];
 
-  // helper: check if position is a valid sentence boundary for prompt extraction
-  function isSentStart(r){return r+5<=corpusIds.length&&bpe.isBoundary(corpusIds[r])&&bpe.startsWithSpace(corpusIds[r+1]);}
+  // corpus sentence starts: what prompt selection draws from
+  const starts=[];
+  for(let p=1;p+4<corpusIds.length;p++)if(bpe.isSentenceStart(corpusIds,p))starts.push(p);
+  if(starts.length<CHAIN/2)starts.length=0; // fewer starts than half the chain would repeat the same openings: keep random positions
 
   for(let si=0;si<CHAIN;si++){
     janusPhasePressure(chambers,si,CHAIN);
@@ -1585,38 +1675,28 @@ function generateChain(inputText){
       if(seedTok>=0&&seedTok<V)for(let d=0;d<D;d++)gdest[d]=0.97*gdest[d]+0.03*tokEmb[seedTok*D+d];
     }
     let prompt=null,usedInterf=false;
-    if(inputText){
+    if(inputText&&si===nb){ // the prompt anchors only the pivot; backward steps keep the corpus, forward steps keep destiny
       prompt=anchoredPromptFromInput(inputText,4);
     }
-    if(!prompt&&interference&&interference.docs.length&&Math.random()<Math.max(0.05,Math.min(0.5,0.3+velocity.interfBonus))){
+    if(!prompt&&interference&&interference.docs.length&&qRandom()<Math.max(0.05,Math.min(0.5,0.3+velocity.interfBonus))){
       const seed=activeChunk?interference.injectSeedFromDoc(activeChunk,chambers,bpe,periodic):(activeDoc?interference.injectSeedFromDoc(activeDoc,chambers,bpe,periodic):interference.injectSeed(chambers,bpe,periodic));
       if(seed!==null){prompt=[seed];usedInterf=true;}
     }
 
     let start=-1;
-    if(!prompt&&dir>=0&&si>0){
-      let bestScore=-1e30,bestPos=-1,tries2=0;
-      while(tries2<50){
-        const r=Math.floor(Math.random()*(corpusIds.length>5?corpusIds.length-5:1));
-        if(isSentStart(r)){
-          let sc=0;const tok=corpusIds[r+1];
-          if(tok<V)for(let d=0;d<D;d++)sc+=tokEmb[tok*D+d]*gdest[d];
-          if(sc>bestScore){bestScore=sc;bestPos=r+1;}
-        }
-        tries2++;
+    if(!prompt&&starts.length&&dir>=0&&si>0){
+      let bestScore=-1e30;
+      for(let k=0;k<50;k++){
+        const p=starts[Math.floor(qRandom()*starts.length)];
+        let sc=0;const tok=corpusIds[p];
+        if(tok<V)for(let d=0;d<D;d++)sc+=tokEmb[tok*D+d]*gdest[d];
+        if(sc>bestScore){bestScore=sc;start=p;}
       }
-      if(bestPos>=0)start=bestPos;
+      qTap('destiny',{step:si+1,score:bestScore,opening:bpe.decode(corpusIds.slice(start,start+5))});
     }
-    if(!prompt&&start<0){
-      let tries=0;
-      while(start<0&&tries<200){
-        const r=Math.floor(Math.random()*(corpusIds.length>5?corpusIds.length-5:1));
-        if(isSentStart(r)){start=r+1;break;}
-        tries++;
-      }
-    }
+    if(!prompt&&start<0&&starts.length)start=starts[Math.floor(qRandom()*starts.length)];
     if(!prompt){
-      if(start<0)start=Math.floor(Math.random()*Math.max(1,corpusIds.length-5));
+      if(start<0)start=Math.floor(qRandom()*Math.max(1,corpusIds.length-5));
       const plen=Math.min(5,corpusIds.length-start);
       prompt=corpusIds.slice(start,start+plen);
     }
@@ -1631,18 +1711,20 @@ function generateChain(inputText){
     let bestOut=null,bestSc=-Infinity;
     let bestQ=-Infinity;
     const gdestSave=new Float32Array(gdest);
-    const candTrials=!tf.loaded&&si<=1?5:3;
+    let gdestBest=gdestSave;
+    const candTrials=!(tf&&tf.loaded)&&si<=1?5:3;
     for(let cand=0;cand<candTrials;cand++){
       if(cand>0)gdest.set(gdestSave);
       let candTemp=temp;
-      if(!tf.loaded&&si<=1&&cand>0)candTemp=Math.max(0.28,Math.min(temp,temp*(0.92-0.06*Math.min(cand,3))));
+      if(!(tf&&tf.loaded)&&si<=1&&cand>0)candTemp=Math.max(0.28,Math.min(temp,temp*(0.92-0.06*Math.min(cand,3))));
       const o=genSentence(prompt,candTemp,gdest,velocity);
       const sc=coherenceScore(o)+0.6*surfaceCoherenceScore(o);
-      const qSc=!tf.loaded&&si<=1?earlySentenceQuality(o):sc;
+      const qSc=!(tf&&tf.loaded)&&si<=1?earlySentenceQuality(o):sc;
       if(qSc>bestQ)bestQ=qSc;
-      if(sc>bestSc){bestSc=sc;bestOut=o;}
+      if(sc>bestSc){bestSc=sc;bestOut=o;gdestBest=new Float32Array(gdest);}
       if(bestQ>0.1&&bestSc>1&&bestOut.length>12)break;
     }
+    gdest.set(gdestBest); // the chosen candidate's destiny goes forward, not the last one's
 
     let wormhole=false;
     if(si<CHAIN-1){
@@ -1650,12 +1732,12 @@ function generateChain(inputText){
       if(cd>0.3)whProb+=((cd-0.3)/0.7)*0.15;
       whProb=Math.max(0,Math.min(0.3,whProb+velocity.wormholeBonus));
       const boundaryOk=bestOut.length>10&&bestSc>(0.22+0.18*phaseGate);
-      wormhole=boundaryOk&&(Math.random()<whProb);
+      wormhole=boundaryOk&&(qRandom()<whProb);
       if(wormhole&&interference&&interference.docs.length){
         const farthest=[...interference.docs].sort((a,b)=>b.heavy.length-a.heavy.length)[0];
         if(farthest&&farthest.heavy.length){
           dir=dir!==0?-dir:1;
-          const whPrompt=[...bestOut.slice(Math.max(0,bestOut.length-3)),farthest.heavy[Math.floor(Math.random()*farthest.heavy.length)]];
+          const whPrompt=[...bestOut.slice(Math.max(0,bestOut.length-3)),farthest.heavy[Math.floor(qRandom()*farthest.heavy.length)]];
           bestOut=genSentence(whPrompt,tf&&tf.loaded?0.55:0.7,gdest,velocity);
           bestSc=coherenceScore(bestOut)+0.6*surfaceCoherenceScore(bestOut);
           if(bestSc<0.15)chambers.debt=Math.max(0,Math.min(1,chambers.debt+0.04));
@@ -1664,7 +1746,7 @@ function generateChain(inputText){
       }
     }
 
-    const text=bpe.decode(bestOut.slice(bpe.displayStartIndex(bestOut))).replace(/^\s+/,'');
+    const text=bpe.decodeSentence(bestOut.slice(bpe.displayStartIndex(bestOut))).replace(/^\s+/,'');
     chainIds.push(bestOut);chainLens.push(bestOut.length);
     if(bestOut.length<5||(bestSc<0.01&&bestOut.length<8)){
       addStep(si+1,dir,'[...]');
@@ -1700,7 +1782,7 @@ function generateChain(inputText){
       const oldSc=coherenceScore(chainIds[weakIdx])+0.6*surfaceCoherenceScore(chainIds[weakIdx]);
       if(newSc>oldSc*0.7||rOut.length>chainIds[weakIdx].length){ // accept if reasonable
         chainIds[weakIdx]=rOut;chainLens[weakIdx]=rOut.length;
-        const rText=bpe.decode(rOut);
+        const rText=bpe.decodeSentence(rOut);
         const dir=weakIdx<nb?-1:weakIdx===nb?0:1;
         addStep(weakIdx+1,dir,rText+' {reseeded}');
         chambers.feel(rText,periodic);
@@ -1739,13 +1821,40 @@ Dawn paints the world gold before the sun fully rises, turning ordinary landscap
 Our brain contains eighty-six billion neurons, each connected to thousands of others through synapses.
 I am not finished. The resonance continues.`;
 
+// weights carry the token ids of q.merges: with weights the vocabulary comes from q.merges (loaded or served next to the page), never relearned
+async function resolveMerges(){
+  if(!loadedMerges&&tf&&tf.loaded){
+    try{const r=await fetch('q.merges');if(r.ok)loadedMerges=await r.arrayBuffer();}catch(_err){}
+  }
+  if(!loadedMerges)return null;
+  const b=new BPE();b.loadBinary(loadedMerges);return b;
+}
+
+// controls follow the outcome: off while the field is rebuilt, on only after a chain was spoken from it
 async function initCorpus(text){
+  const ctl=[$('#btn-gen'),$('#prompt'),$('#btn-send')];
+  for(const c of ctl)c.disabled=true;
+  const t0=performance.now();
+  try{
+    if(await buildCorpus(text)){for(const c of ctl)c.disabled=false;qTap('ready',{ms:performance.now()-t0,state:qState(),memory:qMemory()});}
+    else qTap('failed');
+  }catch(err){log('init failed: '+err.message,'err');qTap('failed');}
+}
+
+async function buildCorpus(text){
+  corpusText=text;
   out.innerHTML='';
-  bpe=new BPE();
   log('PostGPT-Q — Resonant Reasoning Engine (JS)','sys');
   log('[1] BPE...');
-  corpusIds=bpe.learnFromCorpus(text,1024);
-  log(`  ${bpe.merges.length} merges, vocab=${bpe.vocabSize}, ${corpusIds.length} tokens`);
+  bpe=await resolveMerges();
+  if(tf&&tf.loaded&&(!bpe||bpe.vocabSize!==tf.V)){
+    log(bpe?`q.merges vocab=${bpe.vocabSize} does not match weights V=${tf.V}`:'weights need their q.merges: load MERGES (or serve q.merges next to q.html)','err');
+    return;
+  }
+  if(bpe)corpusIds=bpe.encode(text);
+  else{bpe=new BPE();corpusIds=bpe.learnFromCorpus(text,1024);}
+  if(corpusIds.length<2){log(`corpus gave ${corpusIds.length} tokens: nothing to build a field from`,'err');return false;}
+  log(`  ${bpe.merges.length} merges (${loadedMerges?'q.merges':'learned from this corpus'}), vocab=${bpe.vocabSize}, ${corpusIds.length} tokens`);
   log('[2] MetaWeights...');
   mw=new MetaWeights();mw.build(corpusIds,bpe.vocabSize);
   periodic=new PeriodicTable();periodic.buildFromText(text);
@@ -1760,12 +1869,13 @@ async function initCorpus(text){
   await interference.loadDocs(bpe,docInput&&docInput.files.length?docInput.files:null);
   log(`[3] Parliament: ${parliament.n} experts, rank=${DOE_RANK}, d=${D}`);
   log(tf&&tf.loaded?`[4] Transformer: V=${tf.V} D=${tf.D} L=${tf.NL} nc=${tf.NC} nr=${tf.NR} nj=${tf.NJ}`:'[4] No weights — MetaWeights only mode');
+  if(!(tf&&tf.loaded))log('  destiny and parliament are silent here: zero embeddings give them no direction (load weights to wake them)');
   if(interference.docs.length)log(`[4.5] Interference: ${interference.docs.length} docs loaded`);
   $('#mode-badge').textContent=tf&&tf.loaded?'TRAINED':'FIELD';
   $('#mode-badge').className=tf&&tf.loaded?'trained':'';
   log('');log('========== 12 BIDIRECTIONAL STEPS ==========','sys');log('');
   generateChain(null);
-  $('#btn-gen').disabled=false;$('#prompt').disabled=false;$('#btn-send').disabled=false;
+  return true;
 }
 
 async function autoBootFromQuery(){
@@ -1786,9 +1896,12 @@ $('#btn-gen').onclick=()=>{const v=$('#prompt').value.trim();$('#prompt').value=
 $('#btn-send').onclick=$('#btn-gen').onclick;
 $('#prompt').onkeydown=e=>{if(e.key==='Enter')$('#btn-gen').click();};
 
+// merges or weights arriving after the corpus re-run initCorpus, so token ids, memory and weights share one vocabulary
+function onMerges(buf){loadedMerges=buf;log(`BPE merges loaded: ${new DataView(buf).getUint32(0,true)}`,'sys');if(corpusText)initCorpus(corpusText);}
+function onWeights(buf){try{tf=new Transformer();tf.loadBin(buf);log(`Weights loaded: V=${tf.V} D=${tf.D} L=${tf.NL} nc=${tf.NC} nr=${tf.NR} nj=${tf.NJ}`,'sys');$('#mode-badge').textContent='TRAINED';$('#mode-badge').className='trained';if(corpusText)initCorpus(corpusText);}catch(err){tf=null;log('Weight load error: '+err.message,'err');}}
 $('#f-corpus').onchange=e=>{const f=e.target.files[0];if(f){const r=new FileReader();r.onload=()=>initCorpus(r.result);r.readAsText(f);}};
-$('#f-merges').onchange=e=>{const f=e.target.files[0];if(f){const r=new FileReader();r.onload=()=>{bpe=new BPE();bpe.loadBinary(r.result);log(`BPE merges loaded: ${bpe.merges.length}`,'sys');};r.readAsArrayBuffer(f);}};
-$('#f-weights').onchange=e=>{const f=e.target.files[0];if(f){const r=new FileReader();r.onload=()=>{try{tf=new Transformer();tf.loadBin(r.result);log(`Weights loaded: V=${tf.V} D=${tf.D} L=${tf.NL} nc=${tf.NC} nr=${tf.NR} nj=${tf.NJ}`,'sys');$('#mode-badge').textContent='TRAINED';$('#mode-badge').className='trained';if(parliament)parliament=new Parliament(tf.D,4);}catch(err){log('Weight load error: '+err.message,'err');}};r.readAsArrayBuffer(f);}};
+$('#f-merges').onchange=e=>{const f=e.target.files[0];if(f){const r=new FileReader();r.onload=()=>onMerges(r.result);r.readAsArrayBuffer(f);}};
+$('#f-weights').onchange=e=>{const f=e.target.files[0];if(f){const r=new FileReader();r.onload=()=>onWeights(r.result);r.readAsArrayBuffer(f);}};
 
 // drag & drop
 document.body.ondragover=e=>e.preventDefault();
@@ -1796,12 +1909,32 @@ document.body.ondrop=e=>{
   e.preventDefault();
   for(const f of e.dataTransfer.files){
     if(f.name.endsWith('.txt')){const r=new FileReader();r.onload=()=>initCorpus(r.result);r.readAsText(f);}
-    else if(f.name.endsWith('.bin')||f.name.endsWith('.pt')){
-      const r=new FileReader();r.onload=()=>{try{tf=new Transformer();tf.loadBin(r.result);log(`Weights loaded: V=${tf.V} D=${tf.D}`,'sys');$('#mode-badge').textContent='TRAINED';$('#mode-badge').className='trained';}catch(err){log('Error: '+err.message,'err');}};r.readAsArrayBuffer(f);
-    }
-    else if(f.name.endsWith('.merges')){const r=new FileReader();r.onload=()=>{bpe=new BPE();bpe.loadBinary(r.result);log(`Merges loaded: ${bpe.merges.length}`,'sys');};r.readAsArrayBuffer(f);}
+    else if(f.name.endsWith('.bin')||f.name.endsWith('.pt')){const r=new FileReader();r.onload=()=>onWeights(r.result);r.readAsArrayBuffer(f);}
+    else if(f.name.endsWith('.merges')){const r=new FileReader();r.onload=()=>onMerges(r.result);r.readAsArrayBuffer(f);}
   }
 };
+
+if(qEmbedded)addEventListener('message',e=>{
+  const m=e.data;
+  if(e.source!==parent||!m||typeof m.cmd!=='string')return;
+  if(m.cmd==='boot'){qTap('memory',{at:'boot',memory:qMemory()});initCorpus(typeof m.corpus==='string'&&m.corpus?m.corpus:DEMO);}
+  else if(m.cmd==='load'){
+    if(m.merges){
+      try{log(`BPE merges loaded: ${new DataView(m.merges).getUint32(0,true)}`,'sys');loadedMerges=m.merges;}
+      catch(err){log('merges rejected: '+err.message,'err');qTap('failed');return;}
+    }
+    if(m.weights)onWeights(m.weights);
+  }else if(m.cmd==='generate'){
+    if($('#btn-gen').disabled){qTap('refused');return;}
+    $('#prompt').value=m.prompt||'';
+    const t0=performance.now();
+    try{$('#btn-gen').onclick();qTap('done',{ms:performance.now()-t0,state:qState(),memory:qMemory()});}
+    catch(err){log('chain failed: '+err.message,'err');qTap('failed');}
+  }else if(m.cmd==='forget'){
+    try{localStorage.removeItem('q.memory');}catch(_err){}
+    qTap('memory',{at:'forget',memory:qMemory()});
+  }
+});
 
 autoBootFromQuery();
 </script>

@@ -1,8 +1,8 @@
-# PostGPT-Q — Resonant Reasoning Engine 
+# Q — Resonant Reasoning Engine 
 
 **θ = ε + γ + αδ**
 
-A 1182-line C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
+A C inference engine that combines a trained transformer with statistical MetaWeights, a living parliament of LoRA experts, and somatic chambers — producing coherent text from a 2M parameter model that has no right to be coherent.
 
 Q is not a chatbot. Q is an organism that reasons through resonance.
 
@@ -50,7 +50,7 @@ The Dario equation combines them per token:
 logits[i] += c_heb * hebbian[i] + c_pro * prophecy[i] + c_ds * destiny[i] + c_bg * bigram[i] + c_tg * trigram[i]
 ```
 
-Coefficients are adaptive — with trained weights: `c_heb=0.6, c_pro=0.4, c_ds=0.3, c_bg=5.0, c_tg=3.0`. Without weights (MetaWeights only): `c_heb=1.0, c_pro=0.7, c_ds=0.15, c_bg=15.0, c_tg=10.0`. Chambers modulate all coefficients in real time.
+Coefficients are adaptive — with trained weights: `c_heb=0.6, c_pro=0.4, c_ds=0.3, c_bg=5.0, c_tg=3.0`. Without weights (MetaWeights only): `c_heb=1.0, c_pro=0.7, c_ds=0.15, c_bg=15.0, c_tg=10.0`, and the destiny term reads zero whatever `c_ds` says: destiny is built from token embeddings, and without weights there are none to build from. The parliament's δ is zero there for the same reason. The engines say so at startup. Chambers modulate all coefficients in real time.
 
 ### Prophecy (predictive coherence)
 
@@ -141,7 +141,7 @@ The selected chunk then nudges destiny and logits. This is not RAG and not exter
 
 ### Periodic Table (semantic classification)
 
-Every word encountered is classified into one of the 6 chambers by proximity to anchor words. Mass = classification strength. Persists across sessions via `q.sqlite` as the circulating organ, with `q.memory` kept as a binary shard snapshot. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
+Every corpus word is classified at startup into one of the 6 chambers by proximity to anchor words (the C engine reads the first 2048 words of the corpus). Mass = classification strength. Conversation adds no new elements; consolidation nudges the masses of a few existing ones. Persists across sessions via `q.sqlite` as the circulating organ, with `q.memory` kept as a binary shard snapshot. Used by chambers (emotional modulation) and interference (seed selection) to create semantically coherent associations.
 
 ## Generation Pipeline
 
@@ -156,9 +156,9 @@ The backward/forward split is determined by `0.3 + 0.4*debt + 0.1*calendar_disso
 
 ### Per-Step Pipeline
 
-1. **Prompt selection**: sentence-boundary detection (after `.!?` + space). Forward steps select by dot-product of token embedding with global destiny vector (50 candidates)
+1. **Prompt selection**: a corpus sentence start is a token that follows `.!?` plus whitespace. BPE glues that whitespace onto the period (`. `, `.\n\n`), so the next token opens the sentence capitalised and without its own space; a token that brings its own space after a bare `.!?` counts too. Boundary tokens that swallow the next sentence's first word (`. The `) give no usable start. Forward steps draw 50 starts and keep the one whose first token has the highest dot-product with the global destiny vector; without weights every candidate scores zero and the draw is uniform. A corpus with fewer sentence starts than half the chain keeps random positions, so a handful of openings does not repeat across all 12 steps
 2. **Best-of-3**: generate 3 candidates, pick highest coherence score (bigram prob + **trigram continuity** + Hebbian density + length bonus). Enhanced scoring: `bi/(n-1) + 0.5*hebb/(n-1) + 0.8*tri/(n-2) + length_bonus`. Adaptive early exit if first candidate scores >1.0
-3. **Hybrid decoding**: greedy argmax for first 4 tokens (stable trajectory), then nucleus sampling (p=0.85)
+3. **Hybrid decoding**: with weights, greedy argmax for the first 2 tokens (stable trajectory), nucleus p=0.60 at 0.72× temperature for tokens 3–5, then nucleus p=0.85; without weights, greedy for the first 10 tokens, then nucleus p=0.55 at a fixed temperature of 0.35
 4. **Repetition penalty**: distance-weighted (stronger for recent tokens) + bigram blocking
 5. **Frequency penalty**: ultra-common tokens (>1% corpus) dampened
 6. **Word Capture**: after each generated token, update MetaWeights online (bigram + Hebbian)
@@ -172,7 +172,7 @@ A direction vector persists across all 12 steps. Each sentence inherits 30% of g
 
 ### Memory Persistence
 
-`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. It also records **experience events**: scar pressure, wormhole attempts, prophecy pressure, phase shifts, chunk resonance hits, and parliament telemetry. Those events are not passive logs anymore: recent residue is folded back into chamber state on load, and then consolidated before save into stronger prophecy residue, Hebbian co-attraction, periodic anchors, and parliament-derived presence/complexity pressure, so the next run begins with a softened but real trace of what happened before. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. `spores/q.spore.bin` is the slower long-horizon residue layer: a distilled binary spore carrying chamber posture, somatic residue, compact prophecies, and top semantic anchors across longer stretches of time. Q remembers through state, event residue, consolidation, and spores, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist, so Q's vocabulary enriches over time. Somatic state persists as chamber-aligned bodily memory rather than raw text.
+`q.sqlite` is the primary circulating memory organ for the native engines. It stores evolving MetaWeights, the active prophecy field, periodic elements, chamber residue, and session snapshots in structured form. It also records **experience events**: scar pressure, wormhole attempts, prophecy pressure, phase shifts, chunk resonance hits, and parliament telemetry. Those events are not passive logs anymore: recent residue is folded back into chamber state on load, and then consolidated before save into stronger prophecy residue, Hebbian co-attraction, periodic anchors, and parliament-derived presence/complexity pressure, so the next run begins with a softened but real trace of what happened before. `q.memory` remains as a compact binary shard: fallback, backup, and portable snapshot of the same field. `spores/q.spore.bin` is the slower long-horizon residue layer: a distilled binary spore carrying chamber posture, somatic residue, compact prophecies, and top semantic anchors across longer stretches of time. Q remembers through state, event residue, consolidation, and spores, not raw transcript replay. Periodic elements (semantic anchors classified by chamber affinity) persist with their masses; the set of elements is fixed by the corpus, so what grows over time is weight, not vocabulary. Somatic state persists as chamber-aligned bodily memory rather than raw text.
 
 ### SPA — Sentence Phonon Attention
 
@@ -234,20 +234,23 @@ stays inference-only, so q is silent until the substrate earns logit magnitude �
 
 ## Build & Run
 
-Three unified inference engines — same architecture, same constants, same output:
+Three inference engines, one architecture and one Dario equation. They do not produce the same output: each body has its own RNG, and the ports drift in details (the browser keeps raw trigram counts, the Python interference seed is drawn from the top 5 instead of taken as the best). `Q_SEED=<n>` makes a C or Python run repeatable within its own body, and `q.html?seed=<n>` does the same in the browser. The calendar term still follows the wall clock, and saved memory changes the next run, so compare runs from the same starting directory:
 
 ```bash
 # C (fastest, reference implementation)
 gcc postgpt_q.c -O2 -lm -o q
 ./q weights/exported_weights.bin q.merges q.txt # with exported runtime weights
 ./q q.merges q.txt                              # MetaWeights only
+Q_SEED=42 ./q q.merges q.txt                    # repeatable run (same body, same starting memory)
 
 # Python (faithful port)
 python3 postgpt_q.py weights/exported_weights.bin q.merges q.txt
 python3 postgpt_q.py q.merges q.txt
 
 # HTML/JS (browser — standalone, no server needed)
-# Open q.html in browser. Click DEMO or drag-drop q.txt. Drag-drop weights/exported_weights.bin for trained mode.
+# Open q.html in browser. Click DEMO or drag-drop q.txt. For trained mode drop weights/exported_weights.bin and q.merges:
+# the weights speak q.merges token ids, so with weights the page never relearns BPE (served next to q.html, q.merges is fetched).
+# q.html?seed=42 makes the browser run repeatable.
 # Browser memory persists through localStorage, including periodic semantics, somatic state, and phase memory.
 # Native engines also maintain q.sqlite as the primary memory organ and q.memory as a binary shard snapshot.
 ```
@@ -257,8 +260,8 @@ Requires: `q.merges` (BPE merge table, binary) and `q.txt` (corpus).
 ### Tests
 
 ```bash
-gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 40 C tests
-python3 -m unittest tests.test_contract                     # 28 Python contract tests
+gcc tests/test_all.c -O2 -lm -o test_all && ./test_all    # 37 C tests, compiled against postgpt_q.c itself
+python3 -m unittest tests.test_contract                     # 32 Python contract tests
 python3 tests/generation_regression.py                     # fast C meta/trained generation smoke
 python3 tests/generation_regression.py --deep              # slower Python parity smoke
 ```
@@ -334,7 +337,7 @@ The transformer gate silences untrained weights. Pure statistical generation fro
 
 ### JS/HTML inference (q.html, browser)
 
-Open `q.html` in browser. Click DEMO or drag-drop `q.txt`. Drag-drop `.bin` weights for trained mode. Browser memory persists locally, so the semantic field and somatic residue survive reloads.
+Open `q.html` in browser. Click DEMO or drag-drop `q.txt`. Drag-drop `.bin` weights together with `q.merges` for trained mode: the weights know only q.merges token ids, so the page relearns BPE from the corpus only when neither weights nor `q.merges` are loaded. Browser memory persists locally, so the semantic field and somatic residue survive reloads; memory written under another vocabulary keeps its words and chambers and leaves its token tables out.
 
 ```
   [ 1] < The bow pressing steadily on the string, the sound occupying
@@ -397,6 +400,6 @@ See [LICENSE](LICENSE) for the full text.
 
 ---
 
-*PostGPT-Q. 1182 lines of C. 1644 lines of Python. 1256 lines of HTML. Three engines, one resonance. Unbreakable.*
+*PostGPT-Q. C, Python, HTML. Three engines, one resonance. Unbreakable.*
 
 *(c) 2026 arianna method*

@@ -343,6 +343,58 @@ class UnifiedContractTests(unittest.TestCase):
             self.assertGreater(loaded_ch.presence, 0.0)
             self.assertGreater(loaded_ch.scar, 0.0)
 
+    def test_sqlite_reload_merges_without_duplicates(self):
+        ids = [5, 6, 7, 5, 6, 8]
+        saved = q.MetaW()
+        q.ingest_ids(saved, ids, 0.05)
+        saved.trigrams[0][3] = 0.9
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.sqlite")
+            q.save_memory_sqlite(saved, path, q.PeriodicTable(), q.Chambers())
+            field = q.MetaW()
+            q.ingest_ids(field, ids, 0.05)  # the same keys already built, like the corpus field
+            self.assertTrue(q.load_memory_sqlite(field, path, q.PeriodicTable(), q.Chambers()))
+            self.assertEqual((field.n_bi, field.n_tri, field.n_hebb), (saved.n_bi, saved.n_tri, saved.n_hebb))
+            self.assertEqual(len({tuple(t[:3]) for t in field.trigrams}), field.n_tri)
+            self.assertEqual(len({tuple(h[:2]) for h in field.hebbs}), field.n_hebb)
+            self.assertAlmostEqual(field.trigrams[0][3], 0.9, places=6)
+            q.save_memory_sqlite(field, path, q.PeriodicTable(), q.Chambers())  # raised IntegrityError before the merge
+            conn = sqlite3.connect(path)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM trigrams").fetchone()[0], saved.n_tri)
+            conn.close()
+
+    def test_sqlite_failed_save_keeps_previous_memory(self):
+        mw = q.MetaW()
+        q.ingest_ids(mw, [1, 2, 3, 4, 5, 6], 0.05)
+        with tempfile.TemporaryDirectory() as td:
+            path = os.path.join(td, "q.sqlite")
+            q.save_memory_sqlite(mw, path, q.PeriodicTable(), q.Chambers())
+            mw.trigrams.append(list(mw.trigrams[0]))
+            mw.n_tri += 1
+            with self.assertRaises(sqlite3.IntegrityError):
+                q.save_memory_sqlite(mw, path, q.PeriodicTable(), q.Chambers())
+            conn = sqlite3.connect(path)
+            rows = [conn.execute("SELECT COUNT(*) FROM %s" % t).fetchone()[0] for t in ("bigrams", "trigrams", "hebb", "chambers")]
+            conn.close()
+            self.assertEqual(rows, [mw.n_bi, mw.n_tri - 1, mw.n_hebb, 1])
+
+    def test_bpe_find_token_exact_bytes(self):
+        bpe = q.BPE()
+        bpe.vocab_size = 3
+        bpe.vocab_bytes = {0: b"void", 1: b" void", 2: b"voids"}
+        self.assertEqual(q.bpe_find_token(bpe, "void"), 0)
+        self.assertEqual(q.bpe_find_token(bpe, " void"), 1)
+        self.assertEqual(q.bpe_find_token(bpe, "silence"), -1)
+
+    def test_sentence_start_follows_bpe_glued_boundaries(self):
+        bpe = q.BPE()
+        bpe.vocab_size = 7
+        bpe.vocab_bytes = {0: b"s.\n\n", 1: b"Words", 2: b". The ", 3: b"sky", 4: b"!", 5: b" Then", 6: b"words"}
+        self.assertTrue(q.is_sentence_start(bpe, [0, 1], 1))   # space glued onto the period, capital follows
+        self.assertFalse(q.is_sentence_start(bpe, [0, 6], 1))  # lowercase after a glued boundary is not a start
+        self.assertFalse(q.is_sentence_start(bpe, [2, 3], 1))  # the boundary token swallowed the first word
+        self.assertTrue(q.is_sentence_start(bpe, [4, 5], 1))   # bare punctuation, the word brings its own space
+
     def test_sqlite_phase_state_roundtrip(self):
         mw = q.MetaW()
         ch = q.Chambers()

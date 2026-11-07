@@ -1,0 +1,4 @@
+# The /q/ console loads q.html in a same-origin iframe. The site root ships
+# frame-ancestors 'none' on every response, which blocks even our own engine.
+# This override rides in the repository so every deploy carries it.
+Header always set Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'self'; upgrade-insecure-requests"
